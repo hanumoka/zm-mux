@@ -55,6 +55,10 @@ impl ZmPtyProcess {
         self.reader.take()
     }
 
+    pub fn has_reader(&self) -> bool {
+        self.reader.is_some()
+    }
+
     pub fn write_input(&mut self, data: &[u8]) -> ZmResult<()> {
         self.writer.write_all(data)?;
         self.writer.flush()?;

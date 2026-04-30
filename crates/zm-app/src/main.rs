@@ -1,26 +1,139 @@
 use portable_pty::CommandBuilder;
 use softbuffer::Surface;
+use std::collections::HashMap;
 use std::io::Read;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
+use zm_mux::{PaneId, PaneTree, SplitDirection};
 use zm_pty::ZmPtyProcess;
-use zm_render::CpuRenderer;
+use zm_render::{CpuRenderer, PaneRenderInfo, Rect};
 use zm_term::ZmTerm;
 
 const FONT_SIZE: f32 = 16.0;
 const INITIAL_COLS: u16 = 80;
 const INITIAL_ROWS: u16 = 24;
 
-struct TermState {
+struct PaneState {
     term: ZmTerm,
     pty: ZmPtyProcess,
+}
+
+struct MuxState {
+    tree: PaneTree,
+    panes: HashMap<PaneId, PaneState>,
+    focused: PaneId,
     dirty: bool,
+}
+
+impl MuxState {
+    fn new() -> Self {
+        let tree = PaneTree::new();
+        let root = tree.root_pane();
+        let pane = create_pane(INITIAL_COLS, INITIAL_ROWS);
+        let mut panes = HashMap::new();
+        panes.insert(root, pane);
+
+        Self {
+            tree,
+            panes,
+            focused: root,
+            dirty: true,
+        }
+    }
+
+    fn split(
+        &mut self,
+        direction: SplitDirection,
+        renderer: &CpuRenderer,
+        win_width: usize,
+        win_height: usize,
+    ) {
+        if let Some(new_id) = self.tree.split(self.focused, direction) {
+            let layouts = self.tree.layout(win_width, win_height);
+            if let Some((_, rect)) = layouts.iter().find(|(id, _)| *id == new_id) {
+                let (cols, rows) = renderer.cols_rows_for_size(rect.width, rect.height);
+                let pane = create_pane(cols, rows);
+                self.panes.insert(new_id, pane);
+                self.resize_all_panes(renderer, win_width, win_height);
+                self.dirty = true;
+            }
+        }
+    }
+
+    fn close_focused(&mut self) {
+        if self.tree.pane_count() <= 1 {
+            return;
+        }
+        let to_remove = self.focused;
+        let ids = self.tree.pane_ids();
+        let next_focus = ids.iter().find(|id| **id != to_remove).copied().unwrap();
+
+        if self.tree.remove(to_remove) {
+            if let Some(mut ps) = self.panes.remove(&to_remove) {
+                ps.pty.kill().ok();
+            }
+            self.focused = next_focus;
+            self.dirty = true;
+        }
+    }
+
+    fn resize_all_panes(&mut self, renderer: &CpuRenderer, win_width: usize, win_height: usize) {
+        let layouts = self.tree.layout(win_width, win_height);
+        for (id, rect) in &layouts {
+            if let Some(ps) = self.panes.get_mut(id) {
+                let (cols, rows) = renderer.cols_rows_for_size(rect.width, rect.height);
+                if cols > 0 && rows > 0 {
+                    ps.term.resize(cols, rows);
+                    ps.pty.resize(rows, cols).ok();
+                }
+            }
+        }
+    }
+}
+
+fn create_pane(cols: u16, rows: u16) -> PaneState {
+    let cmd = CommandBuilder::new_default_prog();
+    let pty = zm_pty::spawn_pty(rows, cols, cmd).expect("PTY spawn");
+    let term = ZmTerm::new(cols, rows).expect("term init");
+    PaneState { term, pty }
+}
+
+fn start_reader(pane_id: PaneId, state: &Arc<Mutex<MuxState>>) {
+    let state_clone = state.clone();
+    let reader = {
+        let mut s = state.lock().unwrap();
+        s.panes
+            .get_mut(&pane_id)
+            .and_then(|ps| ps.pty.take_reader())
+    };
+
+    if let Some(reader) = reader {
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut s = state_clone.lock().unwrap();
+                        if let Some(ps) = s.panes.get_mut(&pane_id) {
+                            ps.term.feed_bytes(&buf[..n]);
+                            s.dirty = true;
+                        } else {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
 }
 
 struct App {
@@ -28,17 +141,19 @@ struct App {
     context: Option<softbuffer::Context<Arc<Window>>>,
     surface: Option<Surface<Arc<Window>, Arc<Window>>>,
     renderer: CpuRenderer,
-    state: Arc<Mutex<TermState>>,
+    state: Arc<Mutex<MuxState>>,
+    modifiers: ModifiersState,
 }
 
 impl App {
-    fn new(renderer: CpuRenderer, state: Arc<Mutex<TermState>>) -> Self {
+    fn new(renderer: CpuRenderer, state: Arc<Mutex<MuxState>>) -> Self {
         Self {
             window: None,
             context: None,
             surface: None,
             renderer,
             state,
+            modifiers: ModifiersState::empty(),
         }
     }
 
@@ -62,11 +177,38 @@ impl App {
             NonZeroU32::new(size.height).unwrap(),
         );
 
+        let layouts = state.tree.layout(width, height);
+        let pane_infos: Vec<PaneRenderInfo> = layouts
+            .iter()
+            .filter_map(|(id, mux_rect)| {
+                state.panes.get(id).map(|ps| PaneRenderInfo {
+                    term: &ps.term,
+                    rect: Rect {
+                        x: mux_rect.x,
+                        y: mux_rect.y,
+                        width: mux_rect.width,
+                        height: mux_rect.height,
+                    },
+                    focused: *id == state.focused,
+                })
+            })
+            .collect();
+
         let mut buffer = surface.buffer_mut().unwrap();
         let buf_slice: &mut [u32] = &mut buffer;
         self.renderer
-            .render_to_buffer(&state.term, buf_slice, width, height);
+            .render_panes(&pane_infos, buf_slice, width, height);
         let _ = buffer.present();
+    }
+
+    fn win_size(&self) -> (usize, usize) {
+        self.window
+            .as_ref()
+            .map(|w| {
+                let s = w.inner_size();
+                (s.width as usize, s.height as usize)
+            })
+            .unwrap_or((800, 600))
     }
 }
 
@@ -76,10 +218,9 @@ impl ApplicationHandler for App {
             return;
         }
 
-        let (req_w, req_h) = {
-            let state = self.state.lock().unwrap();
-            self.renderer.required_size(&state.term)
-        };
+        let (req_w, req_h) = self
+            .renderer
+            .required_size(INITIAL_COLS as usize, INITIAL_ROWS as usize);
 
         let attrs = Window::default_attributes()
             .with_title("zm-mux")
@@ -93,6 +234,10 @@ impl ApplicationHandler for App {
 
         self.window = Some(window);
         self.surface = Some(surface);
+
+        // Start reader for initial pane
+        let root = self.state.lock().unwrap().tree.root_pane();
+        start_reader(root, &self.state);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -103,23 +248,126 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 self.redraw();
             }
-            WindowEvent::Resized(size) => {
-                let (cw, ch) = self.renderer.cell_size();
-                if cw > 0 && ch > 0 {
-                    let new_cols = (size.width as usize / cw).max(1) as u16;
-                    let new_rows = (size.height as usize / ch).max(1) as u16;
-                    let mut state = self.state.lock().unwrap();
-                    state.term.resize(new_cols, new_rows);
-                    let _ = state.pty.resize(new_rows, new_cols);
-                }
-                if let Some(w) = &self.window {
-                    w.request_redraw();
+            WindowEvent::ModifiersChanged(mods) => {
+                self.modifiers = mods.state();
+            }
+            WindowEvent::Resized(_) => {
+                let (w, h) = self.win_size();
+                let mut state = self.state.lock().unwrap();
+                state.resize_all_panes(&self.renderer, w, h);
+                state.dirty = true;
+                drop(state);
+                if let Some(win) = &self.window {
+                    win.request_redraw();
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
                     return;
                 }
+
+                let ctrl_shift = self.modifiers.contains(ModifiersState::CONTROL)
+                    && self.modifiers.contains(ModifiersState::SHIFT);
+                let alt = self.modifiers.contains(ModifiersState::ALT);
+
+                // Split pane shortcuts
+                if ctrl_shift {
+                    match &event.logical_key {
+                        Key::Character(s) if s.as_str() == "D" || s.as_str() == "d" => {
+                            let (w, h) = self.win_size();
+                            let mut state = self.state.lock().unwrap();
+                            state.split(SplitDirection::Horizontal, &self.renderer, w, h);
+                            // Find new pane and start reader
+                            let new_ids: Vec<PaneId> = state.tree.pane_ids();
+                            drop(state);
+                            for id in new_ids {
+                                let has_reader = self
+                                    .state
+                                    .lock()
+                                    .unwrap()
+                                    .panes
+                                    .get(&id)
+                                    .map(|ps| !ps.pty.has_reader())
+                                    .unwrap_or(true);
+                                if !has_reader {
+                                    start_reader(id, &self.state);
+                                }
+                            }
+                            return;
+                        }
+                        Key::Character(s) if s.as_str() == "E" || s.as_str() == "e" => {
+                            let (w, h) = self.win_size();
+                            let mut state = self.state.lock().unwrap();
+                            state.split(SplitDirection::Vertical, &self.renderer, w, h);
+                            let new_ids: Vec<PaneId> = state.tree.pane_ids();
+                            drop(state);
+                            for id in new_ids {
+                                let has_reader = self
+                                    .state
+                                    .lock()
+                                    .unwrap()
+                                    .panes
+                                    .get(&id)
+                                    .map(|ps| !ps.pty.has_reader())
+                                    .unwrap_or(true);
+                                if !has_reader {
+                                    start_reader(id, &self.state);
+                                }
+                            }
+                            return;
+                        }
+                        Key::Character(s) if s.as_str() == "W" || s.as_str() == "w" => {
+                            let mut state = self.state.lock().unwrap();
+                            state.close_focused();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Focus navigation
+                if alt {
+                    let (w, h) = self.win_size();
+                    let mut state = self.state.lock().unwrap();
+                    let moved = match &event.logical_key {
+                        Key::Named(NamedKey::ArrowRight) => state.tree.find_adjacent(
+                            state.focused,
+                            SplitDirection::Horizontal,
+                            true,
+                            w,
+                            h,
+                        ),
+                        Key::Named(NamedKey::ArrowLeft) => state.tree.find_adjacent(
+                            state.focused,
+                            SplitDirection::Horizontal,
+                            false,
+                            w,
+                            h,
+                        ),
+                        Key::Named(NamedKey::ArrowDown) => state.tree.find_adjacent(
+                            state.focused,
+                            SplitDirection::Vertical,
+                            true,
+                            w,
+                            h,
+                        ),
+                        Key::Named(NamedKey::ArrowUp) => state.tree.find_adjacent(
+                            state.focused,
+                            SplitDirection::Vertical,
+                            false,
+                            w,
+                            h,
+                        ),
+                        _ => None,
+                    };
+                    if let Some(new_focus) = moved {
+                        state.focused = new_focus;
+                        state.dirty = true;
+                    }
+                    return;
+                }
+
+                // Normal key input → focused pane
                 let bytes: Vec<u8> = match &event.logical_key {
                     Key::Character(s) => s.as_bytes().to_vec(),
                     Key::Named(NamedKey::Enter) => vec![b'\r'],
@@ -134,14 +382,16 @@ impl ApplicationHandler for App {
                 };
 
                 let mut state = self.state.lock().unwrap();
-                let _ = state.pty.write_input(&bytes);
+                let focused = state.focused;
+                if let Some(ps) = state.panes.get_mut(&focused) {
+                    let _ = ps.pty.write_input(&bytes);
+                }
             }
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Always request redraw to keep terminal output flowing
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -150,50 +400,7 @@ impl ApplicationHandler for App {
 
 fn main() {
     let renderer = CpuRenderer::new(FONT_SIZE).expect("renderer init");
-
-    let cmd = CommandBuilder::new_default_prog();
-    let mut pty = zm_pty::spawn_pty(INITIAL_ROWS, INITIAL_COLS, cmd).expect("PTY spawn");
-    let term = ZmTerm::new(INITIAL_COLS, INITIAL_ROWS).expect("term init");
-
-    let pty_reader = pty.take_reader().expect("PTY reader");
-
-    let state = Arc::new(Mutex::new(TermState {
-        term,
-        pty,
-        dirty: false,
-    }));
-
-    // Background thread: read PTY output → feed to terminal
-    let state_clone = state.clone();
-    std::thread::spawn(move || {
-        let mut reader = pty_reader;
-        let mut buf = [0u8; 8192];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let mut s = state_clone.lock().unwrap();
-                    s.term.feed_bytes(&buf[..n]);
-                    s.dirty = true;
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    // Periodic redraw trigger
-    let state_redraw = state.clone();
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(16));
-            let mut s = state_redraw.lock().unwrap();
-            if s.dirty {
-                s.dirty = false;
-                // The about_to_wait handler will request redraw
-            }
-            drop(s);
-        }
-    });
+    let state = Arc::new(Mutex::new(MuxState::new()));
 
     let event_loop = EventLoop::new().expect("event loop");
     let mut app = App::new(renderer, state);
