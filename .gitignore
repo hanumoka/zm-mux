@@ -1,0 +1,40 @@
+# Session data (may contain sensitive context)
+.project-memory/
+
+# Claude Code internals
+.claude/logs/
+.claude/plans/
+
+# Build outputs
+dist/
+build/
+target/
+*.exe
+*.dll
+*.pdb
+
+# Dependencies
+node_modules/
+Cargo.lock
+
+# Secrets
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Archives
+*.tar.gz
+*.zip

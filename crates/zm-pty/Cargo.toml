@@ -1,0 +1,10 @@
+[package]
+name = "zm-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cross-platform PTY abstraction for zm-mux"
+
+[dependencies]
+zm-core = { path = "../zm-core" }
+portable-pty = "0.9"

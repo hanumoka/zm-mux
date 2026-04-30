@@ -1,0 +1,18 @@
+[package]
+name = "zm-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "zm-mux application entry point"
+
+[dependencies]
+zm-core = { path = "../zm-core" }
+zm-pty = { path = "../zm-pty" }
+zm-term = { path = "../zm-term" }
+zm-render = { path = "../zm-render" }
+zm-mux = { path = "../zm-mux" }
+zm-agent = { path = "../zm-agent" }
+zm-socket = { path = "../zm-socket" }
+winit = "0.30"
+softbuffer = "0.4"
+portable-pty = "0.9"

@@ -1,0 +1,57 @@
+# Build outputs
+dist/
+build/
+target/
+*.exe
+*.dll
+*.obj
+*.o
+*.pdb
+
+# Dependencies
+node_modules/
+Cargo.lock
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Logs
+*.log
+.claude/logs/
+
+# Cache
+.cache/
+.turbo/
+.swc/
+__pycache__/
+*.pyc
+
+# Test outputs
+coverage/
+playwright-report/
+test-results/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Secrets
+.env
+.env.*
+
+# Archives
+*.tar.gz
+*.zip
+
+# Claude internals
+.project-memory/pre-compact-recovery.md
+.claude/plans/
+
+# Python
+.venv/

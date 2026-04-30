@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zm-core",
+    "crates/zm-pty",
+    "crates/zm-term",
+    "crates/zm-render",
+    "crates/zm-mux",
+    "crates/zm-agent",
+    "crates/zm-socket",
+    "crates/zm-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/hanumoka/zm-mux"

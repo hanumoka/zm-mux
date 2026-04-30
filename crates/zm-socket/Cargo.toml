@@ -1,0 +1,9 @@
+[package]
+name = "zm-socket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Socket API, MCP server, and CustomPaneBackend"
+
+[dependencies]
+zm-core = { path = "../zm-core" }

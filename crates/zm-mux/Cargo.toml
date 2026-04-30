@@ -1,0 +1,11 @@
+[package]
+name = "zm-mux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Terminal multiplexer (session/window/tab/pane tree)"
+
+[dependencies]
+zm-core = { path = "../zm-core" }
+zm-pty = { path = "../zm-pty" }
+zm-term = { path = "../zm-term" }

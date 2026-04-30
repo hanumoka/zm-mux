@@ -1,0 +1,46 @@
+{
+  "env": {
+    "ENABLE_TOOL_SEARCH": "auto:5",
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git branch*)",
+      "Bash(git add*)",
+      "Bash(git commit*)",
+      "Bash(git show*)",
+      "Bash(git rev-parse*)",
+      "Bash(ls*)",
+      "Bash(wc*)",
+      "Bash(cat*)",
+      "Bash(tree*)",
+      "Bash(date*)",
+      "Bash(mkdir*)",
+      "Bash(curl*)",
+      "Bash(npm*)",
+      "Bash(npx*)",
+      "Bash(cargo*)",
+      "Bash(rustc*)",
+      "Bash(python*)",
+      "Bash(pip*)",
+      "WebSearch",
+      "WebFetch(github.com)",
+      "WebFetch(docs.rs)",
+      "WebFetch(crates.io)",
+      "WebFetch(www.npmjs.com)",
+      "WebFetch(learn.microsoft.com)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git reset --hard*)",
+      "Bash(git clean -f*)"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "outputStyle": "Learning"
+}

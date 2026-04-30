@@ -1,0 +1,11 @@
+[package]
+name = "zm-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VT terminal emulation for zm-mux, wrapping alacritty_terminal"
+
+[dependencies]
+zm-core = { path = "../zm-core" }
+alacritty_terminal = "0.26"
+vte = "0.15"

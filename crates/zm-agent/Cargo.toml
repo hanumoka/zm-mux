@@ -1,0 +1,9 @@
+[package]
+name = "zm-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AI agent detection, tmux compat, and agent lifecycle"
+
+[dependencies]
+zm-core = { path = "../zm-core" }

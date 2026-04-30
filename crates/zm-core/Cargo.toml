@@ -1,0 +1,9 @@
+[package]
+name = "zm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared types, errors, and traits for zm-mux"
+
+[dependencies]
+thiserror = "2"
