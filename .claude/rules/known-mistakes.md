@@ -29,3 +29,21 @@
 - **실수**: VT100/xterm 파싱을 처음부터 직접 구현
 - **올바른 방법**: `alacritty_terminal` 크레이트 재사용 (COSMIC Terminal 검증 패턴, ARCH-07)
 - **탐지**: `vte.*parser.*impl|custom.*vt.*parse`
+
+### M-005 [WARN] alacritty_terminal EventListener no-op
+
+- **실수**: `EventListener::send_event` 를 빈 구현으로 두면 `Event::PtyWrite` 가 모두 누락됨 → DSR(`\x1b[6n`) 같은 터미널 쿼리에 응답 못함 → 셸이 응답 대기로 무한 정지 (`452ce1c` 검은 화면 원인)
+- **올바른 방법**: 이벤트를 `Arc<Mutex<Vec<Event>>>` 같은 공유 큐에 push. `feed_bytes` 호출 후 큐를 drain 해 `Event::PtyWrite` 의 String을 PTY writer로 다시 write. `zm-term::ZmTerm::drain_pty_writes()` 참조.
+- **탐지**: `fn\s+send_event\s*\([^)]*\)\s*\{\s*\}`
+
+### M-006 [WARN] winit `about_to_wait` 무조건 request_redraw
+
+- **실수**: winit 0.30+ `ApplicationHandler::about_to_wait` 에서 조건 없이 `window.request_redraw()` 호출하면 즉시 RedrawRequested 이벤트 → about_to_wait 재호출 → busy loop. CPU 100%, 락 starvation, PTY reader thread 굶음 (`452ce1c` CPU 114s/min 원인)
+- **올바른 방법**: dirty flag 로 게이팅 + `ControlFlow::WaitUntil(now + 16ms)` 폴링 또는 `EventLoopProxy::send_event` 로 외부 스레드 신호
+- **탐지**: `fn\s+about_to_wait[^{]*\{[^}]*request_redraw\(\)`
+
+### M-007 [WARN] winit `LogicalSize` 에 physical pixel 사용
+
+- **실수**: 셀 크기(픽셀) × cols/rows 결과를 `LogicalSize::new(...)` 에 넘김 → DPI 1.25/1.5x 환경에서 윈도우가 25~50% 더 크게 뜸 (`452ce1c` 첫 스크린샷의 거대 윈도우 원인)
+- **올바른 방법**: 픽셀 단위면 `PhysicalSize::new(...)`. `LogicalSize` 는 DPI 미적용 좌표일 때만.
+- **탐지**: `LogicalSize::new\([^)]*\b(cell|pixel|width|height|req_w|req_h)\b`
