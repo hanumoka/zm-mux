@@ -1,3 +1,6 @@
+pub mod config;
+pub use config::{Config, FontConfig};
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]

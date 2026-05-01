@@ -1,27 +1,40 @@
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::term::Term;
 use alacritty_terminal::vte::ansi;
+use std::sync::{Arc, Mutex};
 use zm_core::ZmResult;
 
-#[derive(Default)]
+#[derive(Clone)]
 pub struct EventCollector {
-    events: Vec<Event>,
+    events: Arc<Mutex<Vec<Event>>>,
 }
 
 impl EventCollector {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            events: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 
-    pub fn drain_events(&mut self) -> Vec<Event> {
-        std::mem::take(&mut self.events)
+    pub fn shared(&self) -> Arc<Mutex<Vec<Event>>> {
+        self.events.clone()
+    }
+}
+
+impl Default for EventCollector {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl EventListener for EventCollector {
-    fn send_event(&self, _event: Event) {}
+    fn send_event(&self, event: Event) {
+        if let Ok(mut events) = self.events.lock() {
+            events.push(event);
+        }
+    }
 }
 
 pub struct TermSize {
@@ -85,6 +98,7 @@ impl Default for RenderCell {
 pub struct ZmTerm {
     term: Term<EventCollector>,
     parser: ansi::Processor,
+    events: Arc<Mutex<Vec<Event>>>,
 }
 
 impl ZmTerm {
@@ -92,14 +106,39 @@ impl ZmTerm {
         let size = TermSize { cols, rows };
         let config = TermConfig::default();
         let event_collector = EventCollector::new();
+        let events = event_collector.shared();
         let term = Term::new(config, &size, event_collector);
         let parser = ansi::Processor::new();
 
-        Ok(Self { term, parser })
+        Ok(Self {
+            term,
+            parser,
+            events,
+        })
     }
 
     pub fn feed_bytes(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// Drain bytes that the terminal needs to send back to the PTY in response
+    /// to queries like DSR (`\x1b[6n`), color requests, etc.
+    /// Caller must write these bytes to the PTY master.
+    pub fn drain_pty_writes(&self) -> Vec<Vec<u8>> {
+        let mut events = match self.events.lock() {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        let mut keep = Vec::with_capacity(events.len());
+        for ev in events.drain(..) {
+            match ev {
+                Event::PtyWrite(s) => out.push(s.into_bytes()),
+                other => keep.push(other),
+            }
+        }
+        *events = keep;
+        out
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -172,6 +211,57 @@ impl ZmTerm {
     pub fn cursor_position(&self) -> (usize, usize) {
         let cursor = self.term.grid().cursor.point;
         (cursor.line.0 as usize, cursor.column.0)
+    }
+
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    /// Scroll the viewport. Positive `delta` scrolls up (older lines into view),
+    /// negative scrolls down (toward live content).
+    pub fn scroll_lines(&mut self, delta: i32) {
+        self.term.scroll_display(Scroll::Delta(delta));
+    }
+
+    pub fn scroll_page_up(&mut self) {
+        self.term.scroll_display(Scroll::PageUp);
+    }
+
+    pub fn scroll_page_down(&mut self) {
+        self.term.scroll_display(Scroll::PageDown);
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.term.scroll_display(Scroll::Top);
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// True if the cell at (row, col) is the right half of a wide CJK glyph.
+    /// Renderers should skip drawing this cell.
+    pub fn is_wide_spacer(&self, row: usize, col: usize) -> bool {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+        if col >= self.cols() || row >= self.rows() {
+            return false;
+        }
+        let cell = &self.term.grid()[Line(row as i32)][Column(col)];
+        cell.flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+    }
+
+    /// True if the cell at (row, col) is the left half of a wide CJK glyph.
+    /// Renderer should advance 2 cells of horizontal space.
+    pub fn is_wide_char(&self, row: usize, col: usize) -> bool {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+        if col >= self.cols() || row >= self.rows() {
+            return false;
+        }
+        let cell = &self.term.grid()[Line(row as i32)][Column(col)];
+        cell.flags.contains(Flags::WIDE_CHAR)
     }
 }
 

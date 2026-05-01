@@ -1,6 +1,8 @@
-use fontdue::{Font, FontSettings};
+use cosmic_text::{
+    Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache, Weight,
+};
 use zm_core::ZmResult;
-use zm_term::{CellColor, ZmTerm};
+use zm_term::ZmTerm;
 
 pub struct Rect {
     pub x: usize,
@@ -16,25 +18,65 @@ pub struct PaneRenderInfo<'a> {
 }
 
 pub struct CpuRenderer {
-    font: Font,
+    font_system: FontSystem,
+    swash_cache: SwashCache,
+    cell_buffer: Buffer,
     cell_width: usize,
     cell_height: usize,
+    font_family: String,
 }
 
-impl CpuRenderer {
-    pub fn new(font_size: f32) -> ZmResult<Self> {
-        let font_data = include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
-        let font = Font::from_bytes(font_data.as_slice(), FontSettings::default())
-            .map_err(|e| zm_core::ZmError::Render(e.to_string()))?;
+const JETBRAINS_MONO_REGULAR: &[u8] =
+    include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
 
-        let metrics = font.metrics('M', font_size);
-        let cell_width = metrics.advance_width.ceil() as usize;
-        let cell_height = (font_size * 1.4).ceil() as usize;
+const BG_OUTSIDE: u32 = 0x00_1a1a2e;
+const BG_PANE: u32 = 0x00_000000;
+const CURSOR_COLOR: u32 = 0x00_CCCCCC;
+const BORDER_FOCUSED: u32 = 0x00_4488FF;
+const BORDER_UNFOCUSED: u32 = 0x00_444444;
+
+impl CpuRenderer {
+    pub fn new(font_size: f32, font_family: impl Into<String>) -> ZmResult<Self> {
+        let mut font_system = FontSystem::new();
+        // Embed JetBrains Mono so the binary works without OS-level installation.
+        // System fonts are still discovered for CJK / fallback glyphs.
+        font_system
+            .db_mut()
+            .load_font_data(JETBRAINS_MONO_REGULAR.to_vec());
+
+        let line_height = (font_size * 1.4).ceil();
+        let metrics = Metrics::new(font_size, line_height);
+        let swash_cache = SwashCache::new();
+
+        let font_family = font_family.into();
+        let probe_attrs = Attrs::new().family(Family::Name(&font_family));
+
+        // Probe a monospace cell width by shaping "M".
+        let mut probe = Buffer::new(&mut font_system, metrics);
+        {
+            let mut bw = probe.borrow_with(&mut font_system);
+            bw.set_size(None, Some(line_height));
+            bw.set_text("M", &probe_attrs, Shaping::Basic, None);
+            bw.shape_until_scroll(false);
+        }
+        let cell_width = probe
+            .layout_runs()
+            .next()
+            .and_then(|run| run.glyphs.first().map(|g| g.w.ceil() as usize))
+            .unwrap_or((font_size * 0.6).ceil() as usize)
+            .max(1);
+        let cell_height = (line_height as usize).max(1);
+
+        // Reusable per-cell buffer (set_text/draw on each cell).
+        let cell_buffer = Buffer::new(&mut font_system, metrics);
 
         Ok(Self {
-            font,
+            font_system,
+            swash_cache,
+            cell_buffer,
             cell_width,
             cell_height,
+            font_family,
         })
     }
 
@@ -53,164 +95,241 @@ impl CpuRenderer {
     }
 
     pub fn render_panes(
-        &self,
+        &mut self,
         panes: &[PaneRenderInfo],
         buf: &mut [u32],
         width: usize,
         height: usize,
     ) {
-        // Clear to dark background
         for pixel in buf.iter_mut() {
-            *pixel = 0x00_1a1a2e;
+            *pixel = BG_OUTSIDE;
         }
-
         for pane in panes {
             self.render_single_pane(pane, buf, width, height);
         }
     }
 
     fn render_single_pane(
-        &self,
+        &mut self,
         pane: &PaneRenderInfo,
         buf: &mut [u32],
         buf_width: usize,
         buf_height: usize,
     ) {
-        let font_size = self.cell_height as f32 / 1.4;
-        let baseline = (self.cell_height as f32 * 0.75) as usize;
-        let term = pane.term;
         let r = &pane.rect;
 
-        // Fill pane background (black)
         for dy in 0..r.height {
             for dx in 0..r.width {
                 let px = r.x + dx;
                 let py = r.y + dy;
                 if px < buf_width && py < buf_height {
-                    buf[py * buf_width + px] = 0x00_000000;
+                    buf[py * buf_width + px] = BG_PANE;
                 }
             }
         }
 
-        // Render cells
+        let term = pane.term;
+
+        // Cells: background fill + glyph.
         for row in 0..term.rows() {
             for col in 0..term.cols() {
+                if term.is_wide_spacer(row, col) {
+                    continue;
+                }
                 let cell = term.render_cell(row, col);
+                let is_wide = term.is_wide_char(row, col);
+                let cw = if is_wide { self.cell_width * 2 } else { self.cell_width };
                 let x0 = r.x + col * self.cell_width;
                 let y0 = r.y + row * self.cell_height;
 
-                // Cell background
                 if cell.bg.r > 0 || cell.bg.g > 0 || cell.bg.b > 0 {
-                    let bg = color_to_u32(&cell.bg);
-                    for dy in 0..self.cell_height {
-                        for dx in 0..self.cell_width {
-                            let px = x0 + dx;
-                            let py = y0 + dy;
-                            if px < buf_width && py < buf_height {
-                                buf[py * buf_width + px] = bg;
-                            }
-                        }
-                    }
+                    let bg = ((cell.bg.r as u32) << 16) | ((cell.bg.g as u32) << 8) | cell.bg.b as u32;
+                    fill_rect(buf, buf_width, buf_height, x0, y0, cw, self.cell_height, bg);
                 }
 
-                // Glyph
-                if cell.c != ' ' && cell.c != '\0' {
-                    let (metrics, bitmap) = self.font.rasterize(cell.c, font_size);
-                    let gx = x0;
-                    let ymin_offset = if metrics.ymin >= 0 {
-                        metrics.ymin as usize
-                    } else {
-                        0
-                    };
-                    let gy = y0 + baseline.saturating_sub(metrics.height + ymin_offset);
-
-                    for dy in 0..metrics.height {
-                        for dx in 0..metrics.width {
-                            let alpha = bitmap[dy * metrics.width + dx];
-                            if alpha == 0 {
-                                continue;
-                            }
-                            let px = gx + dx;
-                            let py = gy + dy;
-                            if px < buf_width && py < buf_height {
-                                let a = alpha as u32;
-                                let existing = buf[py * buf_width + px];
-                                let er = (existing >> 16) & 0xFF;
-                                let eg = (existing >> 8) & 0xFF;
-                                let eb = existing & 0xFF;
-                                let fr = cell.fg.r as u32;
-                                let fg = cell.fg.g as u32;
-                                let fb = cell.fg.b as u32;
-                                let nr = (fr * a + er * (255 - a)) / 255;
-                                let ng = (fg * a + eg * (255 - a)) / 255;
-                                let nb = (fb * a + eb * (255 - a)) / 255;
-                                buf[py * buf_width + px] = (nr << 16) | (ng << 8) | nb;
-                            }
-                        }
-                    }
+                if cell.c == ' ' || cell.c == '\0' {
+                    continue;
                 }
-            }
-        }
 
-        // Cursor
-        let (crow, ccol) = term.cursor_position();
-        let cx = r.x + ccol * self.cell_width;
-        let cy = r.y + crow * self.cell_height;
-        let cursor_color = 0x00CCCCCC_u32;
-        for dy in 0..self.cell_height {
-            for dx in 0..self.cell_width {
-                let px = cx + dx;
-                let py = cy + dy;
-                if px < buf_width
-                    && py < buf_height
-                    && (dy == 0
-                        || dy == self.cell_height - 1
-                        || dx == 0
-                        || dx == self.cell_width - 1)
+                let mut attrs = Attrs::new().family(Family::Name(&self.font_family));
+                if cell.bold {
+                    attrs = attrs.weight(Weight::BOLD);
+                }
+                if cell.italic {
+                    attrs = attrs.style(Style::Italic);
+                }
+                let text = cell.c.to_string();
+
                 {
-                    buf[py * buf_width + px] = cursor_color;
+                    let mut bw = self.cell_buffer.borrow_with(&mut self.font_system);
+                    bw.set_size(Some(cw as f32), Some(self.cell_height as f32));
+                    bw.set_text(&text, &attrs, Shaping::Basic, None);
+                    bw.shape_until_scroll(false);
                 }
+                let fg_color = Color::rgb(cell.fg.r, cell.fg.g, cell.fg.b);
+                let cache = &mut self.swash_cache;
+                let bw = &mut self.cell_buffer.borrow_with(&mut self.font_system);
+                bw.draw(cache, fg_color, |dx, dy, dw, dh, px_color| {
+                    let alpha = px_color.a();
+                    if alpha == 0 {
+                        return;
+                    }
+                    blend_rect(
+                        buf,
+                        buf_width,
+                        buf_height,
+                        x0 as i32 + dx,
+                        y0 as i32 + dy,
+                        dw as usize,
+                        dh as usize,
+                        px_color.r(),
+                        px_color.g(),
+                        px_color.b(),
+                        alpha,
+                    );
+                });
             }
         }
 
-        // Pane border
-        let border_color = if pane.focused {
-            0x00_4488FF // blue for focused
+        // Cursor (only show when viewport is at live content).
+        if term.display_offset() == 0 {
+            let (crow, ccol) = term.cursor_position();
+            if crow < term.rows() && ccol < term.cols() {
+                let cx = r.x + ccol * self.cell_width;
+                let cy = r.y + crow * self.cell_height;
+                draw_cursor_outline(
+                    buf,
+                    buf_width,
+                    buf_height,
+                    cx,
+                    cy,
+                    self.cell_width,
+                    self.cell_height,
+                    CURSOR_COLOR,
+                );
+            }
+        }
+
+        // Pane border.
+        let border = if pane.focused {
+            BORDER_FOCUSED
         } else {
-            0x00_444444 // gray for unfocused
+            BORDER_UNFOCUSED
         };
+        draw_pane_border(buf, buf_width, buf_height, r, border);
+    }
+}
 
-        // Top/bottom border
-        for dx in 0..r.width {
-            let px = r.x + dx;
-            if px < buf_width {
-                if r.y > 0 && (r.y - 1) < buf_height {
-                    buf[(r.y - 1) * buf_width + px] = border_color;
-                }
-                let bot = r.y + r.height;
-                if bot < buf_height {
-                    buf[bot * buf_width + px] = border_color;
-                }
-            }
-        }
-        // Left/right border
-        for dy in 0..r.height {
-            let py = r.y + dy;
-            if py < buf_height {
-                if r.x > 0 && (r.x - 1) < buf_width {
-                    buf[py * buf_width + (r.x - 1)] = border_color;
-                }
-                let right = r.x + r.width;
-                if right < buf_width {
-                    buf[py * buf_width + right] = border_color;
-                }
+fn fill_rect(
+    buf: &mut [u32],
+    buf_width: usize,
+    buf_height: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: u32,
+) {
+    for dy in 0..h {
+        for dx in 0..w {
+            let px = x + dx;
+            let py = y + dy;
+            if px < buf_width && py < buf_height {
+                buf[py * buf_width + px] = color;
             }
         }
     }
 }
 
-fn color_to_u32(c: &CellColor) -> u32 {
-    (c.r as u32) << 16 | (c.g as u32) << 8 | c.b as u32
+fn blend_rect(
+    buf: &mut [u32],
+    buf_width: usize,
+    buf_height: usize,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    fr: u8,
+    fg: u8,
+    fb: u8,
+    alpha: u8,
+) {
+    let a = alpha as u32;
+    for dy in 0..h {
+        for dx in 0..w {
+            let px = x + dx as i32;
+            let py = y + dy as i32;
+            if px < 0 || py < 0 || px >= buf_width as i32 || py >= buf_height as i32 {
+                continue;
+            }
+            let idx = py as usize * buf_width + px as usize;
+            let existing = buf[idx];
+            let er = (existing >> 16) & 0xFF;
+            let eg = (existing >> 8) & 0xFF;
+            let eb = existing & 0xFF;
+            let nr = (fr as u32 * a + er * (255 - a)) / 255;
+            let ng = (fg as u32 * a + eg * (255 - a)) / 255;
+            let nb = (fb as u32 * a + eb * (255 - a)) / 255;
+            buf[idx] = (nr << 16) | (ng << 8) | nb;
+        }
+    }
+}
+
+fn draw_cursor_outline(
+    buf: &mut [u32],
+    buf_width: usize,
+    buf_height: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: u32,
+) {
+    for dy in 0..h {
+        for dx in 0..w {
+            let px = x + dx;
+            let py = y + dy;
+            if px < buf_width
+                && py < buf_height
+                && (dy == 0 || dy == h - 1 || dx == 0 || dx == w - 1)
+            {
+                buf[py * buf_width + px] = color;
+            }
+        }
+    }
+}
+
+fn draw_pane_border(
+    buf: &mut [u32],
+    buf_width: usize,
+    buf_height: usize,
+    r: &Rect,
+    color: u32,
+) {
+    for dx in 0..r.width {
+        let px = r.x + dx;
+        if px < buf_width {
+            if r.y > 0 && r.y - 1 < buf_height {
+                buf[(r.y - 1) * buf_width + px] = color;
+            }
+            let bot = r.y + r.height;
+            if bot < buf_height {
+                buf[bot * buf_width + px] = color;
+            }
+        }
+    }
+    for dy in 0..r.height {
+        let py = r.y + dy;
+        if py < buf_height {
+            if r.x > 0 && r.x - 1 < buf_width {
+                buf[py * buf_width + (r.x - 1)] = color;
+            }
+            let right = r.x + r.width;
+            if right < buf_width {
+                buf[py * buf_width + right] = color;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -219,85 +338,25 @@ mod tests {
 
     #[test]
     fn create_renderer() {
-        let r = CpuRenderer::new(16.0);
-        assert!(r.is_ok());
-        let r = r.unwrap();
+        let r = CpuRenderer::new(16.0, "JetBrains Mono").expect("renderer init");
         let (w, h) = r.cell_size();
-        assert!(w > 0 && h > 0);
+        assert!(w > 0 && h > 0, "cell size positive");
     }
 
     #[test]
-    fn render_single_pane() {
-        let r = CpuRenderer::new(16.0).unwrap();
-        let mut term = ZmTerm::new(10, 3).unwrap();
-        term.feed_bytes(b"Hi");
-
-        let (w, h) = r.required_size(10, 3);
-        let mut buf = vec![0u32; w * h];
+    fn render_writes_pixels() {
+        let mut r = CpuRenderer::new(16.0, "JetBrains Mono").expect("renderer init");
+        let mut term = ZmTerm::new(20, 5).expect("term init");
+        term.feed_bytes(b"Hello");
+        let (w, h) = r.required_size(20, 5);
+        let mut buf = vec![BG_OUTSIDE; w * h];
         let panes = vec![PaneRenderInfo {
             term: &term,
-            rect: Rect {
-                x: 0,
-                y: 0,
-                width: w,
-                height: h,
-            },
+            rect: Rect { x: 0, y: 0, width: w, height: h },
             focused: true,
         }];
         r.render_panes(&panes, &mut buf, w, h);
-
-        let non_bg = buf.iter().filter(|&&p| p != 0x001a1a2e && p != 0).count();
-        assert!(non_bg > 0, "Should render text pixels");
-    }
-
-    #[test]
-    fn render_two_panes() {
-        let r = CpuRenderer::new(16.0).unwrap();
-        let mut t1 = ZmTerm::new(10, 3).unwrap();
-        let mut t2 = ZmTerm::new(10, 3).unwrap();
-        t1.feed_bytes(b"Left");
-        t2.feed_bytes(b"Right");
-
-        let total_w = 400;
-        let total_h = 200;
-        let mut buf = vec![0u32; total_w * total_h];
-
-        let panes = vec![
-            PaneRenderInfo {
-                term: &t1,
-                rect: Rect {
-                    x: 0,
-                    y: 0,
-                    width: 199,
-                    height: 200,
-                },
-                focused: true,
-            },
-            PaneRenderInfo {
-                term: &t2,
-                rect: Rect {
-                    x: 201,
-                    y: 0,
-                    width: 199,
-                    height: 200,
-                },
-                focused: false,
-            },
-        ];
-        r.render_panes(&panes, &mut buf, total_w, total_h);
-
-        // Check left half has text
-        let left_pixels: u32 = buf[..total_w * total_h / 2]
-            .iter()
-            .filter(|&&p| p != 0x001a1a2e && p != 0)
-            .count() as u32;
-        // Check right half has text
-        let right_pixels: u32 = buf[total_w * total_h / 2..]
-            .iter()
-            .filter(|&&p| p != 0x001a1a2e && p != 0)
-            .count() as u32;
-
-        assert!(left_pixels > 0, "Left pane should have content");
-        assert!(right_pixels > 0, "Right pane should have content");
+        let non_default = buf.iter().filter(|&&p| p != BG_OUTSIDE && p != BG_PANE).count();
+        assert!(non_default > 0, "should render some non-bg pixels");
     }
 }

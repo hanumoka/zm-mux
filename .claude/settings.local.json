@@ -27,11 +27,13 @@
       "Bash(python*)",
       "Bash(pip*)",
       "WebSearch",
-      "WebFetch(github.com)",
-      "WebFetch(docs.rs)",
-      "WebFetch(crates.io)",
-      "WebFetch(www.npmjs.com)",
-      "WebFetch(learn.microsoft.com)"
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:www.npmjs.com)",
+      "WebFetch(domain:learn.microsoft.com)",
+      "Bash(powershell.exe *)",
+      "Bash(cmd.exe *)"
     ],
     "deny": [
       "Bash(rm -rf *)",

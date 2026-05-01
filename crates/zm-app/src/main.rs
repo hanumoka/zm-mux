@@ -5,17 +5,17 @@ use std::io::Read;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
+use zm_core::Config;
 use zm_mux::{PaneId, PaneTree, SplitDirection};
 use zm_pty::ZmPtyProcess;
 use zm_render::{CpuRenderer, PaneRenderInfo, Rect};
 use zm_term::ZmTerm;
 
-const FONT_SIZE: f32 = 16.0;
 const INITIAL_COLS: u16 = 80;
 const INITIAL_ROWS: u16 = 24;
 
@@ -124,6 +124,12 @@ fn start_reader(pane_id: PaneId, state: &Arc<Mutex<MuxState>>) {
                         let mut s = state_clone.lock().unwrap();
                         if let Some(ps) = s.panes.get_mut(&pane_id) {
                             ps.term.feed_bytes(&buf[..n]);
+                            // Reply to terminal queries (DSR cursor position, etc.)
+                            // alacritty_terminal emits these as PtyWrite events;
+                            // without forwarding them the shell stalls waiting.
+                            for w in ps.term.drain_pty_writes() {
+                                let _ = ps.pty.write_input(&w);
+                            }
                             s.dirty = true;
                         } else {
                             break;
@@ -163,12 +169,16 @@ impl App {
             return;
         };
 
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let size = window.inner_size();
         let width = size.width as usize;
         let height = size.height as usize;
 
         if width == 0 || height == 0 {
+            return;
+        }
+
+        if !state.dirty {
             return;
         }
 
@@ -199,6 +209,8 @@ impl App {
         self.renderer
             .render_panes(&pane_infos, buf_slice, width, height);
         let _ = buffer.present();
+
+        state.dirty = false;
     }
 
     fn win_size(&self) -> (usize, usize) {
@@ -224,7 +236,7 @@ impl ApplicationHandler for App {
 
         let attrs = Window::default_attributes()
             .with_title("zm-mux")
-            .with_inner_size(winit::dpi::LogicalSize::new(req_w as u32, req_h as u32));
+            .with_inner_size(winit::dpi::PhysicalSize::new(req_w as u32, req_h as u32));
 
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
@@ -251,6 +263,21 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y.round() as i32 * 3,
+                    MouseScrollDelta::PixelDelta(pos) => (pos.y / 16.0).round() as i32,
+                };
+                if lines == 0 {
+                    return;
+                }
+                let mut state = self.state.lock().unwrap();
+                let focused = state.focused;
+                if let Some(ps) = state.panes.get_mut(&focused) {
+                    ps.term.scroll_lines(lines);
+                    state.dirty = true;
+                }
+            }
             WindowEvent::Resized(_) => {
                 let (w, h) = self.win_size();
                 let mut state = self.state.lock().unwrap();
@@ -269,6 +296,42 @@ impl ApplicationHandler for App {
                 let ctrl_shift = self.modifiers.contains(ModifiersState::CONTROL)
                     && self.modifiers.contains(ModifiersState::SHIFT);
                 let alt = self.modifiers.contains(ModifiersState::ALT);
+                let shift_only = self.modifiers.contains(ModifiersState::SHIFT)
+                    && !self.modifiers.contains(ModifiersState::CONTROL)
+                    && !alt;
+
+                // Scrollback navigation (Shift+PgUp/PgDn/Home/End)
+                if shift_only {
+                    let mut state = self.state.lock().unwrap();
+                    let focused = state.focused;
+                    let scrolled = if let Some(ps) = state.panes.get_mut(&focused) {
+                        match &event.logical_key {
+                            Key::Named(NamedKey::PageUp) => {
+                                ps.term.scroll_page_up();
+                                true
+                            }
+                            Key::Named(NamedKey::PageDown) => {
+                                ps.term.scroll_page_down();
+                                true
+                            }
+                            Key::Named(NamedKey::Home) => {
+                                ps.term.scroll_to_top();
+                                true
+                            }
+                            Key::Named(NamedKey::End) => {
+                                ps.term.scroll_to_bottom();
+                                true
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    };
+                    if scrolled {
+                        state.dirty = true;
+                        return;
+                    }
+                }
 
                 // Split pane shortcuts
                 if ctrl_shift {
@@ -383,23 +446,42 @@ impl ApplicationHandler for App {
 
                 let mut state = self.state.lock().unwrap();
                 let focused = state.focused;
+                let mut snap_dirty = false;
                 if let Some(ps) = state.panes.get_mut(&focused) {
+                    // Snap viewport back to live content on user input.
+                    if ps.term.display_offset() != 0 {
+                        ps.term.scroll_to_bottom();
+                        snap_dirty = true;
+                    }
                     let _ = ps.pty.write_input(&bytes);
+                }
+                if snap_dirty {
+                    state.dirty = true;
                 }
             }
             _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(w) = &self.window {
-            w.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let needs_redraw = self.state.lock().unwrap().dirty;
+        if needs_redraw {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
         }
+        // Poll dirty flag at ~60Hz so PTY reader thread output reaches the
+        // screen without an EventLoopProxy.  TODO: switch to EventLoopProxy.
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+            std::time::Instant::now() + std::time::Duration::from_millis(16),
+        ));
     }
 }
 
 fn main() {
-    let renderer = CpuRenderer::new(FONT_SIZE).expect("renderer init");
+    let config = Config::load();
+    let renderer =
+        CpuRenderer::new(config.font.size, &config.font.family).expect("renderer init");
     let state = Arc::new(Mutex::new(MuxState::new()));
 
     let event_loop = EventLoop::new().expect("event loop");

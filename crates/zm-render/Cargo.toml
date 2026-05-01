@@ -9,4 +9,4 @@ description = "GPU/CPU rendering for zm-mux (glyphon + wgpu + softbuffer)"
 zm-core = { path = "../zm-core" }
 zm-term = { path = "../zm-term" }
 softbuffer = "0.4"
-fontdue = "0.9"
+cosmic-text = "0.19"
