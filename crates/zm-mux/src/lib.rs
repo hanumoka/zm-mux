@@ -1,3 +1,7 @@
+pub mod tabs;
+
+pub use tabs::{Tab, TabId, TabSet};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PaneId(pub u32);
 
@@ -26,34 +30,29 @@ enum PaneNode {
     },
 }
 
+#[derive(Debug)]
 pub struct PaneTree {
     root: PaneNode,
-    next_id: u32,
 }
 
 impl PaneTree {
-    pub fn new() -> Self {
-        let id = PaneId(0);
+    pub fn with_initial_pane(initial: PaneId) -> Self {
         Self {
-            root: PaneNode::Leaf(id),
-            next_id: 1,
+            root: PaneNode::Leaf(initial),
         }
     }
 
     pub fn root_pane(&self) -> PaneId {
-        self.find_first_leaf(&self.root)
+        Self::find_first_leaf(&self.root)
     }
 
-    pub fn split(&mut self, target: PaneId, direction: SplitDirection) -> Option<PaneId> {
-        let new_id = PaneId(self.next_id);
-        self.next_id += 1;
-
-        if Self::split_node(&mut self.root, target, direction, new_id) {
-            Some(new_id)
-        } else {
-            self.next_id -= 1;
-            None
-        }
+    pub fn split(
+        &mut self,
+        target: PaneId,
+        direction: SplitDirection,
+        new_id: PaneId,
+    ) -> bool {
+        Self::split_node(&mut self.root, target, direction, new_id)
     }
 
     pub fn remove(&mut self, target: PaneId) -> bool {
@@ -239,17 +238,11 @@ impl PaneTree {
         }
     }
 
-    fn find_first_leaf(&self, node: &PaneNode) -> PaneId {
+    fn find_first_leaf(node: &PaneNode) -> PaneId {
         match node {
             PaneNode::Leaf(id) => *id,
-            PaneNode::Split { first, .. } => self.find_first_leaf(first),
+            PaneNode::Split { first, .. } => Self::find_first_leaf(first),
         }
-    }
-}
-
-impl Default for PaneTree {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -257,44 +250,46 @@ impl Default for PaneTree {
 mod tests {
     use super::*;
 
+    fn fresh() -> PaneTree {
+        PaneTree::with_initial_pane(PaneId(0))
+    }
+
     #[test]
     fn new_tree_has_one_pane() {
-        let tree = PaneTree::new();
+        let tree = fresh();
         assert_eq!(tree.pane_count(), 1);
         assert_eq!(tree.root_pane(), PaneId(0));
     }
 
     #[test]
     fn split_creates_two_panes() {
-        let mut tree = PaneTree::new();
+        let mut tree = fresh();
         let root = tree.root_pane();
-        let new_pane = tree.split(root, SplitDirection::Horizontal);
-        assert!(new_pane.is_some());
+        assert!(tree.split(root, SplitDirection::Horizontal, PaneId(1)));
         assert_eq!(tree.pane_count(), 2);
     }
 
     #[test]
-    fn split_invalid_id_returns_none() {
-        let mut tree = PaneTree::new();
-        let result = tree.split(PaneId(999), SplitDirection::Horizontal);
-        assert!(result.is_none());
+    fn split_invalid_id_returns_false() {
+        let mut tree = fresh();
+        assert!(!tree.split(PaneId(999), SplitDirection::Horizontal, PaneId(1)));
         assert_eq!(tree.pane_count(), 1);
     }
 
     #[test]
     fn remove_pane() {
-        let mut tree = PaneTree::new();
+        let mut tree = fresh();
         let root = tree.root_pane();
-        let new_pane = tree.split(root, SplitDirection::Horizontal).unwrap();
+        assert!(tree.split(root, SplitDirection::Horizontal, PaneId(1)));
         assert_eq!(tree.pane_count(), 2);
 
-        tree.remove(new_pane);
+        tree.remove(PaneId(1));
         assert_eq!(tree.pane_count(), 1);
     }
 
     #[test]
     fn cannot_remove_last_pane() {
-        let mut tree = PaneTree::new();
+        let mut tree = fresh();
         let root = tree.root_pane();
         assert!(!tree.remove(root));
         assert_eq!(tree.pane_count(), 1);
@@ -302,7 +297,7 @@ mod tests {
 
     #[test]
     fn layout_single_pane() {
-        let tree = PaneTree::new();
+        let tree = fresh();
         let layouts = tree.layout(800, 600);
         assert_eq!(layouts.len(), 1);
         assert_eq!(layouts[0].1.x, 0);
@@ -313,9 +308,9 @@ mod tests {
 
     #[test]
     fn layout_horizontal_split() {
-        let mut tree = PaneTree::new();
+        let mut tree = fresh();
         let root = tree.root_pane();
-        tree.split(root, SplitDirection::Horizontal);
+        tree.split(root, SplitDirection::Horizontal, PaneId(1));
 
         let layouts = tree.layout(800, 600);
         assert_eq!(layouts.len(), 2);
@@ -332,9 +327,9 @@ mod tests {
 
     #[test]
     fn layout_vertical_split() {
-        let mut tree = PaneTree::new();
+        let mut tree = fresh();
         let root = tree.root_pane();
-        tree.split(root, SplitDirection::Vertical);
+        tree.split(root, SplitDirection::Vertical, PaneId(1));
 
         let layouts = tree.layout(800, 600);
         assert_eq!(layouts.len(), 2);
@@ -351,11 +346,11 @@ mod tests {
 
     #[test]
     fn layout_four_panes() {
-        let mut tree = PaneTree::new();
+        let mut tree = fresh();
         let p0 = tree.root_pane();
-        let p1 = tree.split(p0, SplitDirection::Horizontal).unwrap();
-        tree.split(p0, SplitDirection::Vertical);
-        tree.split(p1, SplitDirection::Vertical);
+        tree.split(p0, SplitDirection::Horizontal, PaneId(1));
+        tree.split(p0, SplitDirection::Vertical, PaneId(2));
+        tree.split(PaneId(1), SplitDirection::Vertical, PaneId(3));
 
         let layouts = tree.layout(800, 600);
         assert_eq!(layouts.len(), 4);
@@ -368,14 +363,14 @@ mod tests {
 
     #[test]
     fn find_adjacent_horizontal() {
-        let mut tree = PaneTree::new();
+        let mut tree = fresh();
         let p0 = tree.root_pane();
-        let p1 = tree.split(p0, SplitDirection::Horizontal).unwrap();
+        tree.split(p0, SplitDirection::Horizontal, PaneId(1));
 
         let right = tree.find_adjacent(p0, SplitDirection::Horizontal, true, 800, 600);
-        assert_eq!(right, Some(p1));
+        assert_eq!(right, Some(PaneId(1)));
 
-        let left = tree.find_adjacent(p1, SplitDirection::Horizontal, false, 800, 600);
+        let left = tree.find_adjacent(PaneId(1), SplitDirection::Horizontal, false, 800, 600);
         assert_eq!(left, Some(p0));
     }
 }

@@ -11,6 +11,11 @@ mod gpu_rect;
 pub use cpu::CpuBackend;
 pub use gpu::GpuBackend;
 
+/// Height of the tab bar in physical pixels.  The tab bar always occupies
+/// the top stripe of the window; pane content sits below it.  Sized so a
+/// 16pt font fits with 4px padding on each side.
+pub const TAB_BAR_HEIGHT_PX: u32 = 24;
+
 pub struct Rect {
     pub x: usize,
     pub y: usize,
@@ -24,16 +29,47 @@ pub struct PaneRenderInfo<'a> {
     pub focused: bool,
 }
 
+/// One tab's display label.  The renderer draws the title text inside the
+/// tab cell and uses `TabBarInfo::active_index` for accent.
+pub struct TabLabel<'a> {
+    pub title: &'a str,
+}
+
+pub struct TabBarInfo<'a> {
+    pub tabs: &'a [TabLabel<'a>],
+    pub active_index: usize,
+}
+
 /// Backend-agnostic terminal renderer.
 ///
 /// Implementations own their own presentation surface (softbuffer for CPU,
 /// wgpu surface for GPU). zm-app calls `render(...)` once per frame; size
 /// args reflect the latest window inner size in physical pixels.
+///
+/// `required_size` and `cols_rows_for_size` get default impls that
+/// reserve `TAB_BAR_HEIGHT_PX` from the vertical budget so backends only
+/// implement `cell_size` and `render`.
 pub trait Renderer {
     fn cell_size(&self) -> (usize, usize);
-    fn required_size(&self, cols: usize, rows: usize) -> (usize, usize);
-    fn cols_rows_for_size(&self, width: usize, height: usize) -> (u16, u16);
-    fn render(&mut self, panes: &[PaneRenderInfo], width: u32, height: u32) -> ZmResult<()>;
+
+    fn required_size(&self, cols: usize, rows: usize) -> (usize, usize) {
+        let (cw, ch) = self.cell_size();
+        (cols * cw, rows * ch + TAB_BAR_HEIGHT_PX as usize)
+    }
+
+    fn cols_rows_for_size(&self, width: usize, height: usize) -> (u16, u16) {
+        let (cw, ch) = self.cell_size();
+        let avail_h = height.saturating_sub(TAB_BAR_HEIGHT_PX as usize);
+        ((width / cw).max(1) as u16, (avail_h / ch).max(1) as u16)
+    }
+
+    fn render(
+        &mut self,
+        tab_bar: &TabBarInfo,
+        panes: &[PaneRenderInfo],
+        width: u32,
+        height: u32,
+    ) -> ZmResult<()>;
 }
 
 /// Try to construct the most capable renderer available, falling back to CPU.

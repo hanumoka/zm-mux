@@ -8,7 +8,7 @@ use softbuffer::{Context, Surface};
 use winit::window::Window;
 use zm_core::{ZmError, ZmResult};
 
-use crate::{PaneRenderInfo, Rect, Renderer};
+use crate::{PaneRenderInfo, Rect, Renderer, TAB_BAR_HEIGHT_PX, TabBarInfo};
 
 const JETBRAINS_MONO_REGULAR: &[u8] =
     include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
@@ -18,6 +18,12 @@ const BG_PANE: u32 = 0x00_000000;
 const CURSOR_COLOR: u32 = 0x00_CCCCCC;
 const BORDER_FOCUSED: u32 = 0x00_4488FF;
 const BORDER_UNFOCUSED: u32 = 0x00_444444;
+const BG_TAB_BAR: u32 = 0x00_0F0F1A;
+const BG_TAB_ACTIVE: u32 = 0x00_2A4880;
+const BG_TAB_INACTIVE: u32 = 0x00_1A1A2E;
+const FG_TAB_R: u8 = 0xE0;
+const FG_TAB_G: u8 = 0xE0;
+const FG_TAB_B: u8 = 0xE0;
 
 // Shaping + rasterization state, separable from presentation surface
 // so the surface borrow in render() does not block draw access to these.
@@ -71,6 +77,7 @@ impl CellShaper {
 
     fn draw_panes(
         &mut self,
+        tab_bar: &TabBarInfo,
         panes: &[PaneRenderInfo],
         buf: &mut [u32],
         width: usize,
@@ -79,8 +86,105 @@ impl CellShaper {
         for pixel in buf.iter_mut() {
             *pixel = BG_OUTSIDE;
         }
+        self.draw_tab_bar(tab_bar, buf, width, height);
         for pane in panes {
             self.draw_single_pane(pane, buf, width, height);
+        }
+    }
+
+    fn draw_tab_bar(
+        &mut self,
+        tab_bar: &TabBarInfo,
+        buf: &mut [u32],
+        buf_width: usize,
+        buf_height: usize,
+    ) {
+        let bar_h = TAB_BAR_HEIGHT_PX as usize;
+        if buf_height < bar_h || buf_width == 0 {
+            return;
+        }
+
+        // Bar background — covers the strip even when there are no tabs.
+        for y in 0..bar_h {
+            let row_start = y * buf_width;
+            for x in 0..buf_width {
+                buf[row_start + x] = BG_TAB_BAR;
+            }
+        }
+
+        if tab_bar.tabs.is_empty() {
+            return;
+        }
+        let tab_count = tab_bar.tabs.len();
+        let tab_w = (buf_width / tab_count).max(1);
+
+        for (i, label) in tab_bar.tabs.iter().enumerate() {
+            let x0 = i * tab_w;
+            let cell_w = if i == tab_count - 1 {
+                buf_width.saturating_sub(x0) // remainder pixels go to last tab
+            } else {
+                tab_w
+            };
+            let bg = if i == tab_bar.active_index {
+                BG_TAB_ACTIVE
+            } else {
+                BG_TAB_INACTIVE
+            };
+
+            // Per-tab cell background
+            for y in 0..bar_h {
+                let row_start = y * buf_width;
+                for x in 0..cell_w {
+                    let px = x0 + x;
+                    if px < buf_width {
+                        buf[row_start + px] = bg;
+                    }
+                }
+            }
+
+            // 1-px separator on the right edge (skip last tab)
+            if i != tab_count - 1 {
+                let sep_x = x0 + cell_w.saturating_sub(1);
+                if sep_x < buf_width {
+                    for y in 0..bar_h {
+                        buf[y * buf_width + sep_x] = BG_TAB_BAR;
+                    }
+                }
+            }
+
+            // Tab title — left-padded, vertically centered
+            let attrs = Attrs::new().family(Family::Name(&self.font_family));
+            let text_w = cell_w.saturating_sub(8) as f32;
+            {
+                let mut bw = self.cell_buffer.borrow_with(&mut self.font_system);
+                bw.set_size(Some(text_w), Some(bar_h as f32));
+                bw.set_text(label.title, &attrs, Shaping::Basic, None);
+                bw.shape_until_scroll(false);
+            }
+            let fg_color = Color::rgb(FG_TAB_R, FG_TAB_G, FG_TAB_B);
+            let cache = &mut self.swash_cache;
+            let bw = &mut self.cell_buffer.borrow_with(&mut self.font_system);
+            let text_x = x0 + 6;
+            let text_y = bar_h.saturating_sub(self.cell_height) / 2;
+            bw.draw(cache, fg_color, |dx, dy, dw, dh, px_color| {
+                let alpha = px_color.a();
+                if alpha == 0 {
+                    return;
+                }
+                blend_rect(
+                    buf,
+                    buf_width,
+                    buf_height,
+                    text_x as i32 + dx,
+                    text_y as i32 + dy,
+                    dw as usize,
+                    dh as usize,
+                    px_color.r(),
+                    px_color.g(),
+                    px_color.b(),
+                    alpha,
+                );
+            });
         }
     }
 
@@ -230,20 +334,13 @@ impl Renderer for CpuBackend {
         (self.shaper.cell_width, self.shaper.cell_height)
     }
 
-    fn required_size(&self, cols: usize, rows: usize) -> (usize, usize) {
-        (
-            cols * self.shaper.cell_width,
-            rows * self.shaper.cell_height,
-        )
-    }
-
-    fn cols_rows_for_size(&self, width: usize, height: usize) -> (u16, u16) {
-        let cols = (width / self.shaper.cell_width).max(1) as u16;
-        let rows = (height / self.shaper.cell_height).max(1) as u16;
-        (cols, rows)
-    }
-
-    fn render(&mut self, panes: &[PaneRenderInfo], width: u32, height: u32) -> ZmResult<()> {
+    fn render(
+        &mut self,
+        tab_bar: &TabBarInfo,
+        panes: &[PaneRenderInfo],
+        width: u32,
+        height: u32,
+    ) -> ZmResult<()> {
         let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) else {
             return Ok(());
         };
@@ -259,7 +356,7 @@ impl Renderer for CpuBackend {
 
         let buf_slice: &mut [u32] = &mut buffer;
         self.shaper
-            .draw_panes(panes, buf_slice, width as usize, height as usize);
+            .draw_panes(tab_bar, panes, buf_slice, width as usize, height as usize);
 
         buffer
             .present()
@@ -268,6 +365,7 @@ impl Renderer for CpuBackend {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fill_rect(
     buf: &mut [u32],
     buf_width: usize,
@@ -289,6 +387,7 @@ fn fill_rect(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn blend_rect(
     buf: &mut [u32],
     buf_width: usize,
@@ -323,6 +422,7 @@ fn blend_rect(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_cursor_outline(
     buf: &mut [u32],
     buf_width: usize,

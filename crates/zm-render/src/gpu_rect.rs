@@ -144,6 +144,7 @@ fn vertex_bytes(verts: &[RectVertex]) -> &[u8] {
 /// Append a filled rectangle in window pixel space.  Color must already
 /// be in linear RGB (call srgb_to_linear on sRGB input).  width/height
 /// are the surface size in pixels.
+#[allow(clippy::too_many_arguments)]
 pub fn push_rect(
     out: &mut Vec<RectVertex>,
     x: i32,

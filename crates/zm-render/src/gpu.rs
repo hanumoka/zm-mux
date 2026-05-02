@@ -9,7 +9,7 @@ use winit::window::Window;
 use zm_core::{ZmError, ZmResult};
 
 use crate::gpu_rect::{push_rect, RectPipeline, RectVertex};
-use crate::{PaneRenderInfo, Renderer};
+use crate::{PaneRenderInfo, Renderer, TAB_BAR_HEIGHT_PX, TabBarInfo};
 
 const JETBRAINS_MONO_REGULAR: &[u8] =
     include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
@@ -28,12 +28,13 @@ const CURSOR_SRGB: (u8, u8, u8) = (0xCC, 0xCC, 0xCC);
 const BORDER_FOCUSED_SRGB: (u8, u8, u8) = (0x44, 0x88, 0xFF);
 const BORDER_UNFOCUSED_SRGB: (u8, u8, u8) = (0x44, 0x44, 0x44);
 
+// Tab bar palette (sRGB).
+const TAB_BAR_BG_SRGB: (u8, u8, u8) = (0x0F, 0x0F, 0x1A);
+const TAB_ACTIVE_SRGB: (u8, u8, u8) = (0x2A, 0x48, 0x80);
+const TAB_INACTIVE_SRGB: (u8, u8, u8) = (0x1A, 0x1A, 0x2E);
+const TAB_TEXT_FG: (u8, u8, u8) = (0xE0, 0xE0, 0xE0);
+
 /// GPU-accelerated renderer using wgpu + glyphon.
-///
-/// Phase 1.3.9-B-2 status: text drawing via glyphon TextRenderer is wired,
-/// sRGB clear color is gamma-corrected.  Cursor outline + pane borders
-/// land in 1.3.9-B-3 (solid-color rect shader).  Until then the GPU
-/// backend is opt-in via `ZM_RENDER=gpu`; default stays CPU.
 pub struct GpuBackend {
     cell_width: usize,
     cell_height: usize,
@@ -165,22 +166,27 @@ fn srgb_byte_to_linear(b: u8) -> f64 {
     srgb_to_linear(b as f64 / 255.0)
 }
 
+fn srgb_triplet_to_linear(rgb: (u8, u8, u8)) -> [f32; 4] {
+    [
+        srgb_byte_to_linear(rgb.0) as f32,
+        srgb_byte_to_linear(rgb.1) as f32,
+        srgb_byte_to_linear(rgb.2) as f32,
+        1.0,
+    ]
+}
+
 impl Renderer for GpuBackend {
     fn cell_size(&self) -> (usize, usize) {
         (self.cell_width, self.cell_height)
     }
 
-    fn required_size(&self, cols: usize, rows: usize) -> (usize, usize) {
-        (cols * self.cell_width, rows * self.cell_height)
-    }
-
-    fn cols_rows_for_size(&self, width: usize, height: usize) -> (u16, u16) {
-        let cols = (width / self.cell_width).max(1) as u16;
-        let rows = (height / self.cell_height).max(1) as u16;
-        (cols, rows)
-    }
-
-    fn render(&mut self, panes: &[PaneRenderInfo], width: u32, height: u32) -> ZmResult<()> {
+    fn render(
+        &mut self,
+        tab_bar: &TabBarInfo,
+        panes: &[PaneRenderInfo],
+        width: u32,
+        height: u32,
+    ) -> ZmResult<()> {
         if width == 0 || height == 0 {
             return Ok(());
         }
@@ -205,10 +211,6 @@ impl Renderer for GpuBackend {
             let term = pane.term;
             let default_attrs = Attrs::new().family(Family::Name(&font_family));
 
-            // Aggregate cell text into a single string and a parallel
-            // AttrsList that paints each cell's foreground.  Wide-spacers
-            // are skipped because the wide char itself already occupies
-            // both columns from cosmic-text's perspective.
             let mut text = String::new();
             let mut byte_spans: Vec<(std::ops::Range<usize>, CTColor, bool, bool)> = Vec::new();
             let mut byte_pos = 0usize;
@@ -268,8 +270,44 @@ impl Renderer for GpuBackend {
             pane_buffers.push(buffer);
         }
 
-        // Build TextAreas borrowing the per-pane Buffers above.
-        let text_areas: Vec<TextArea> = pane_buffers
+        // Build per-tab title Buffers.  Layout = even split across the bar
+        // width, one Buffer per tab cell (text-only; backgrounds are drawn
+        // by the rect pipeline below).
+        let bar_h = TAB_BAR_HEIGHT_PX as usize;
+        let tab_count = tab_bar.tabs.len();
+        // Safe even when tab_count == 0 — the tab_buffers loop below skips
+        // and the rect-pipeline tab_count check guards usage.
+        let tab_w_default = (width as usize) / tab_count.max(1);
+        let tab_text_y = bar_h.saturating_sub(self.cell_height) / 2;
+
+        // Each tab_buffer entry carries (Buffer, text_left_x, cell_right_x).
+        let mut tab_buffers: Vec<(Buffer, usize, usize)> = Vec::with_capacity(tab_count);
+        for (i, label) in tab_bar.tabs.iter().enumerate() {
+            let x0 = i * tab_w_default;
+            let cell_w = if i == tab_count - 1 {
+                (width as usize).saturating_sub(x0).max(1)
+            } else {
+                tab_w_default
+            };
+            let text_left = x0 + 6;
+            let text_right = x0 + cell_w;
+            let text_w = text_right.saturating_sub(text_left).max(1) as f32;
+
+            let attrs = Attrs::new().family(Family::Name(&font_family));
+            let mut buffer = Buffer::new(&mut self.font_system, metrics);
+            {
+                let mut bw = buffer.borrow_with(&mut self.font_system);
+                bw.set_size(Some(text_w), Some(bar_h as f32));
+                bw.set_wrap(Wrap::None);
+                bw.set_text(label.title, &attrs, Shaping::Basic, None);
+                bw.shape_until_scroll(false);
+            }
+            tab_buffers.push((buffer, text_left, text_right));
+        }
+
+        // Build TextAreas: panes first, then tab titles.  Both share one
+        // prepare/render call.
+        let mut text_areas: Vec<TextArea> = pane_buffers
             .iter()
             .zip(panes.iter())
             .map(|(buffer, pane)| TextArea {
@@ -287,6 +325,22 @@ impl Renderer for GpuBackend {
                 custom_glyphs: &[],
             })
             .collect();
+        for (buffer, text_left, text_right) in &tab_buffers {
+            text_areas.push(TextArea {
+                buffer,
+                left: *text_left as f32,
+                top: tab_text_y as f32,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: *text_left as i32,
+                    top: 0,
+                    right: *text_right as i32,
+                    bottom: bar_h as i32,
+                },
+                default_color: Color::rgb(TAB_TEXT_FG.0, TAB_TEXT_FG.1, TAB_TEXT_FG.2),
+                custom_glyphs: &[],
+            });
+        }
 
         self.text_renderer
             .prepare(
@@ -300,39 +354,76 @@ impl Renderer for GpuBackend {
             )
             .map_err(|e| ZmError::Render(format!("glyphon prepare: {e}")))?;
 
-        // Build rect vertex list: cursor outline (4 thin rects) + pane border
-        // (4 thin rects) for each pane.  Colors converted to linear once
-        // since the surface is sRGB.
-        let cursor_color = [
-            srgb_byte_to_linear(CURSOR_SRGB.0) as f32,
-            srgb_byte_to_linear(CURSOR_SRGB.1) as f32,
-            srgb_byte_to_linear(CURSOR_SRGB.2) as f32,
-            1.0,
-        ];
-        let border_focused = [
-            srgb_byte_to_linear(BORDER_FOCUSED_SRGB.0) as f32,
-            srgb_byte_to_linear(BORDER_FOCUSED_SRGB.1) as f32,
-            srgb_byte_to_linear(BORDER_FOCUSED_SRGB.2) as f32,
-            1.0,
-        ];
-        let border_unfocused = [
-            srgb_byte_to_linear(BORDER_UNFOCUSED_SRGB.0) as f32,
-            srgb_byte_to_linear(BORDER_UNFOCUSED_SRGB.1) as f32,
-            srgb_byte_to_linear(BORDER_UNFOCUSED_SRGB.2) as f32,
-            1.0,
-        ];
+        // Linear color cache (sRGB → linear once).
+        let cursor_color = srgb_triplet_to_linear(CURSOR_SRGB);
+        let border_focused = srgb_triplet_to_linear(BORDER_FOCUSED_SRGB);
+        let border_unfocused = srgb_triplet_to_linear(BORDER_UNFOCUSED_SRGB);
+        let tab_bar_bg = srgb_triplet_to_linear(TAB_BAR_BG_SRGB);
+        let tab_active_bg = srgb_triplet_to_linear(TAB_ACTIVE_SRGB);
+        let tab_inactive_bg = srgb_triplet_to_linear(TAB_INACTIVE_SRGB);
+
         let mut rect_verts: Vec<RectVertex> = Vec::new();
+
+        // Tab bar — full strip background, then per-tab cell, then 1px
+        // separator on every cell except the last.
+        if tab_count > 0 {
+            push_rect(
+                &mut rect_verts,
+                0,
+                0,
+                width as i32,
+                bar_h as i32,
+                tab_bar_bg,
+                width,
+                height,
+            );
+            for (i, _label) in tab_bar.tabs.iter().enumerate() {
+                let x0 = i * tab_w_default;
+                let cell_w = if i == tab_count - 1 {
+                    (width as usize).saturating_sub(x0).max(1)
+                } else {
+                    tab_w_default
+                };
+                let bg = if i == tab_bar.active_index {
+                    tab_active_bg
+                } else {
+                    tab_inactive_bg
+                };
+                push_rect(
+                    &mut rect_verts,
+                    x0 as i32,
+                    0,
+                    cell_w as i32,
+                    bar_h as i32,
+                    bg,
+                    width,
+                    height,
+                );
+                if i != tab_count - 1 {
+                    push_rect(
+                        &mut rect_verts,
+                        (x0 + cell_w - 1) as i32,
+                        0,
+                        1,
+                        bar_h as i32,
+                        tab_bar_bg,
+                        width,
+                        height,
+                    );
+                }
+            }
+        }
+
+        // Pane borders + cursor outlines.
         for pane in panes {
             let r = &pane.rect;
             let term = pane.term;
 
-            // Pane border (1px lines just outside the pane rect).
             let border = if pane.focused {
                 border_focused
             } else {
                 border_unfocused
             };
-            // Top
             push_rect(
                 &mut rect_verts,
                 r.x as i32,
@@ -343,7 +434,6 @@ impl Renderer for GpuBackend {
                 width,
                 height,
             );
-            // Bottom
             push_rect(
                 &mut rect_verts,
                 r.x as i32,
@@ -354,7 +444,6 @@ impl Renderer for GpuBackend {
                 width,
                 height,
             );
-            // Left
             push_rect(
                 &mut rect_verts,
                 r.x as i32 - 1,
@@ -365,7 +454,6 @@ impl Renderer for GpuBackend {
                 width,
                 height,
             );
-            // Right
             push_rect(
                 &mut rect_verts,
                 (r.x + r.width) as i32,
@@ -377,7 +465,6 @@ impl Renderer for GpuBackend {
                 height,
             );
 
-            // Cursor outline (only when viewport is at live content).
             if term.display_offset() == 0 {
                 let (crow, ccol) = term.cursor_position();
                 if crow < term.rows() && ccol < term.cols() {
@@ -385,9 +472,7 @@ impl Renderer for GpuBackend {
                     let cy = r.y as i32 + crow as i32 * self.cell_height as i32;
                     let cw = self.cell_width as i32;
                     let ch = self.cell_height as i32;
-                    // Top edge
                     push_rect(&mut rect_verts, cx, cy, cw, 1, cursor_color, width, height);
-                    // Bottom edge
                     push_rect(
                         &mut rect_verts,
                         cx,
@@ -398,9 +483,7 @@ impl Renderer for GpuBackend {
                         width,
                         height,
                     );
-                    // Left edge
                     push_rect(&mut rect_verts, cx, cy, 1, ch, cursor_color, width, height);
-                    // Right edge
                     push_rect(
                         &mut rect_verts,
                         cx + cw - 1,
@@ -440,7 +523,7 @@ impl Renderer for GpuBackend {
             });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("zm-mux gpu clear+text"),
+                label: Some("zm-mux gpu clear+text+rects"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -460,12 +543,14 @@ impl Renderer for GpuBackend {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.text_renderer
-                .render(&self.atlas, &self.viewport, &mut pass)
-                .map_err(|e| ZmError::Render(format!("glyphon render: {e}")))?;
+            // Order: rects (tab bar bg, pane borders, cursor) BEFORE text so
+            // tab titles + cell glyphs sit on top of their backgrounds.
             if let Some(ref buf) = rect_buffer {
                 self.rect_pipeline.draw(&mut pass, buf, rect_verts.len() as u32);
             }
+            self.text_renderer
+                .render(&self.atlas, &self.viewport, &mut pass)
+                .map_err(|e| ZmError::Render(format!("glyphon render: {e}")))?;
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
@@ -476,9 +561,7 @@ impl Renderer for GpuBackend {
 /// Split aggregated text + AttrsList into per-line (String, AttrsList) pairs
 /// at '\n' boundaries.  Each output line owns its own AttrsList sliced from
 /// the input.  Used because cosmic_text::Buffer::lines wants one BufferLine
-/// per terminal row; using set_text on the joined string with embedded '\n'
-/// would still create lines but would not let us push into Buffer.lines
-/// directly.
+/// per terminal row.
 fn split_lines_with_attrs(
     text: &str,
     attrs: &AttrsList,

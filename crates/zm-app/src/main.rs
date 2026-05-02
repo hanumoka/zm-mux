@@ -9,9 +9,11 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use zm_core::Config;
-use zm_mux::{PaneId, PaneTree, SplitDirection};
+use zm_mux::{PaneId, SplitDirection, TabSet};
 use zm_pty::ZmPtyProcess;
-use zm_render::{PaneRenderInfo, Rect, Renderer, create_renderer};
+use zm_render::{
+    PaneRenderInfo, Rect, Renderer, TAB_BAR_HEIGHT_PX, TabBarInfo, TabLabel, create_renderer,
+};
 use zm_term::ZmTerm;
 
 const INITIAL_COLS: u16 = 80;
@@ -23,26 +25,27 @@ struct PaneState {
 }
 
 struct MuxState {
-    tree: PaneTree,
+    tabs: TabSet,
     panes: HashMap<PaneId, PaneState>,
-    focused: PaneId,
     dirty: bool,
 }
 
 impl MuxState {
     fn new() -> Self {
-        let tree = PaneTree::new();
-        let root = tree.root_pane();
+        let (tabs, initial_pane) = TabSet::new();
         let pane = create_pane(INITIAL_COLS, INITIAL_ROWS);
         let mut panes = HashMap::new();
-        panes.insert(root, pane);
+        panes.insert(initial_pane, pane);
 
         Self {
-            tree,
+            tabs,
             panes,
-            focused: root,
             dirty: true,
         }
+    }
+
+    fn focused_pane(&self) -> PaneId {
+        self.tabs.active().focused_pane
     }
 
     fn split(
@@ -52,39 +55,118 @@ impl MuxState {
         win_width: usize,
         win_height: usize,
     ) {
-        if let Some(new_id) = self.tree.split(self.focused, direction) {
-            let layouts = self.tree.layout(win_width, win_height);
-            if let Some((_, rect)) = layouts.iter().find(|(id, _)| *id == new_id) {
-                let (cols, rows) = renderer.cols_rows_for_size(rect.width, rect.height);
-                let pane = create_pane(cols, rows);
-                self.panes.insert(new_id, pane);
-                self.resize_all_panes(renderer, win_width, win_height);
-                self.dirty = true;
-            }
+        let new_id = self.tabs.alloc_pane_id();
+        let target = self.tabs.active().focused_pane;
+        let did_split;
+        let layout;
+        {
+            let tab = self.tabs.active_mut();
+            did_split = tab.tree.split(target, direction, new_id);
+            layout = if did_split {
+                Some(tab.tree.layout(win_width, win_height))
+            } else {
+                None
+            };
+        }
+        if !did_split {
+            return;
+        }
+        let layout = layout.unwrap();
+        if let Some((_, rect)) = layout.iter().find(|(id, _)| *id == new_id) {
+            let (cols, rows) = renderer.cols_rows_for_size(rect.width, rect.height);
+            let pane = create_pane(cols, rows);
+            self.panes.insert(new_id, pane);
+            self.resize_all_panes(renderer, win_width, win_height);
+            self.dirty = true;
         }
     }
 
-    fn close_focused(&mut self) {
-        if self.tree.pane_count() <= 1 {
+    fn close_focused_pane(&mut self) {
+        let to_remove;
+        {
+            let tab = self.tabs.active_mut();
+            if tab.tree.pane_count() <= 1 {
+                return;
+            }
+            let focused = tab.focused_pane;
+            let ids = tab.tree.pane_ids();
+            let next_focus = ids
+                .iter()
+                .find(|id| **id != focused)
+                .copied()
+                .unwrap_or(focused);
+            if !tab.tree.remove(focused) {
+                return;
+            }
+            tab.focused_pane = next_focus;
+            to_remove = focused;
+        }
+        if let Some(mut ps) = self.panes.remove(&to_remove) {
+            ps.pty.kill().ok();
+        }
+        self.dirty = true;
+    }
+
+    fn close_active_tab(&mut self) {
+        let removed = self.tabs.close_active();
+        if removed.is_empty() {
             return;
         }
-        let to_remove = self.focused;
-        let ids = self.tree.pane_ids();
-        let next_focus = ids.iter().find(|id| **id != to_remove).copied().unwrap();
-
-        if self.tree.remove(to_remove) {
-            if let Some(mut ps) = self.panes.remove(&to_remove) {
+        for id in removed {
+            if let Some(mut ps) = self.panes.remove(&id) {
                 ps.pty.kill().ok();
             }
-            self.focused = next_focus;
+        }
+        self.dirty = true;
+    }
+
+    /// Create a new tab whose initial pane occupies the full available area
+    /// (caller passes the viewport size used for sizing the PTY).  Returns
+    /// the PaneId of the new tab's first pane so the caller can wire a reader.
+    fn create_new_tab(
+        &mut self,
+        renderer: &dyn Renderer,
+        win_width: usize,
+        win_height: usize,
+    ) -> PaneId {
+        let (_tab_id, initial_pane) = self.tabs.create_tab();
+        let (cols, rows) = renderer.cols_rows_for_size(win_width, win_height);
+        let pane = create_pane(cols, rows);
+        self.panes.insert(initial_pane, pane);
+        self.dirty = true;
+        initial_pane
+    }
+
+    fn switch_tab_next(&mut self) {
+        if self.tabs.switch_next() {
+            self.dirty = true;
+        }
+    }
+
+    fn switch_tab_prev(&mut self) {
+        if self.tabs.switch_prev() {
+            self.dirty = true;
+        }
+    }
+
+    fn switch_tab_to_index(&mut self, idx: usize) {
+        if self.tabs.switch_to_index(idx) {
             self.dirty = true;
         }
     }
 
     fn resize_all_panes(&mut self, renderer: &dyn Renderer, win_width: usize, win_height: usize) {
-        let layouts = self.tree.layout(win_width, win_height);
-        for (id, rect) in &layouts {
-            if let Some(ps) = self.panes.get_mut(id) {
+        // Pre-collect every pane's layout across all tabs so the borrow on
+        // self.tabs ends before we touch self.panes.  All tabs share the
+        // same window viewport.
+        let all_layouts: Vec<(PaneId, zm_mux::Rect)> = self
+            .tabs
+            .tabs()
+            .iter()
+            .flat_map(|tab| tab.tree.layout(win_width, win_height))
+            .collect();
+        for (id, rect) in all_layouts {
+            if let Some(ps) = self.panes.get_mut(&id) {
                 let (cols, rows) = renderer.cols_rows_for_size(rect.width, rect.height);
                 if cols > 0 && rows > 0 {
                     ps.term.resize(cols, rows);
@@ -178,7 +260,10 @@ impl App {
             return;
         }
 
-        let layouts = state.tree.layout(width as usize, height as usize);
+        let pane_area_h = (height as usize).saturating_sub(TAB_BAR_HEIGHT_PX as usize);
+        let active = state.tabs.active();
+        let layouts = active.tree.layout(width as usize, pane_area_h);
+        let focused = active.focused_pane;
         let pane_infos: Vec<PaneRenderInfo> = layouts
             .iter()
             .filter_map(|(id, mux_rect)| {
@@ -186,33 +271,62 @@ impl App {
                     term: &ps.term,
                     rect: Rect {
                         x: mux_rect.x,
-                        y: mux_rect.y,
+                        y: mux_rect.y + TAB_BAR_HEIGHT_PX as usize,
                         width: mux_rect.width,
                         height: mux_rect.height,
                     },
-                    focused: *id == state.focused,
+                    focused: *id == focused,
                 })
             })
             .collect();
 
+        // Tab bar payload — owned title strings so the active-tab borrow
+        // ends before render(), then borrowed labels for the slice handoff.
+        let tab_titles: Vec<String> = state
+            .tabs
+            .tabs()
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| {
+                tab.title
+                    .clone()
+                    .unwrap_or_else(|| format!("Tab {}", i + 1))
+            })
+            .collect();
+        let active_index = state.tabs.active_index();
+        let tab_labels: Vec<TabLabel> = tab_titles
+            .iter()
+            .map(|t| TabLabel { title: t.as_str() })
+            .collect();
+        let tab_bar = TabBarInfo {
+            tabs: &tab_labels,
+            active_index,
+        };
+
         let Some(renderer) = self.renderer.as_deref_mut() else {
             return;
         };
-        if let Err(e) = renderer.render(&pane_infos, width, height) {
+        if let Err(e) = renderer.render(&tab_bar, &pane_infos, width, height) {
             eprintln!("render error: {e}");
         }
 
         state.dirty = false;
     }
 
-    fn win_size(&self) -> (usize, usize) {
-        self.window
+    /// Pane viewport size — full window minus the tab bar strip.  Layouts,
+    /// PTY resizes, and split allocations all use this so coordinates inside
+    /// PaneTree are pane-area-relative; the redraw step adds the tab bar
+    /// offset before handing rects to the renderer.
+    fn pane_area_size(&self) -> (usize, usize) {
+        let (w, h) = self
+            .window
             .as_ref()
             .map(|w| {
                 let s = w.inner_size();
                 (s.width as usize, s.height as usize)
             })
-            .unwrap_or((800, 600))
+            .unwrap_or((800, 600));
+        (w, h.saturating_sub(TAB_BAR_HEIGHT_PX as usize))
     }
 }
 
@@ -254,8 +368,8 @@ impl ApplicationHandler for App {
         self.renderer = Some(renderer);
 
         // Start reader for initial pane
-        let root = self.state.lock().unwrap().tree.root_pane();
-        start_reader(root, &self.state);
+        let initial = self.state.lock().unwrap().tabs.active().focused_pane;
+        start_reader(initial, &self.state);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -278,14 +392,14 @@ impl ApplicationHandler for App {
                     return;
                 }
                 let mut state = self.state.lock().unwrap();
-                let focused = state.focused;
+                let focused = state.focused_pane();
                 if let Some(ps) = state.panes.get_mut(&focused) {
                     ps.term.scroll_lines(lines);
                     state.dirty = true;
                 }
             }
             WindowEvent::Resized(_) => {
-                let (w, h) = self.win_size();
+                let (w, h) = self.pane_area_size();
                 if let Some(renderer) = self.renderer_ref() {
                     let mut state = self.state.lock().unwrap();
                     state.resize_all_panes(renderer, w, h);
@@ -300,17 +414,17 @@ impl ApplicationHandler for App {
                     return;
                 }
 
-                let ctrl_shift = self.modifiers.contains(ModifiersState::CONTROL)
-                    && self.modifiers.contains(ModifiersState::SHIFT);
+                let ctrl = self.modifiers.contains(ModifiersState::CONTROL);
+                let shift = self.modifiers.contains(ModifiersState::SHIFT);
                 let alt = self.modifiers.contains(ModifiersState::ALT);
-                let shift_only = self.modifiers.contains(ModifiersState::SHIFT)
-                    && !self.modifiers.contains(ModifiersState::CONTROL)
-                    && !alt;
+                let ctrl_only = ctrl && !shift && !alt;
+                let ctrl_shift = ctrl && shift && !alt;
+                let shift_only = shift && !ctrl && !alt;
 
                 // Scrollback navigation (Shift+PgUp/PgDn/Home/End)
                 if shift_only {
                     let mut state = self.state.lock().unwrap();
-                    let focused = state.focused;
+                    let focused = state.focused_pane();
                     let scrolled = if let Some(ps) = state.panes.get_mut(&focused) {
                         match &event.logical_key {
                             Key::Named(NamedKey::PageUp) => {
@@ -340,49 +454,80 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // Split pane shortcuts
+                // Tab management — Ctrl-only chord
+                if ctrl_only {
+                    match &event.logical_key {
+                        Key::Character(s) if s.as_str() == "t" || s.as_str() == "T" => {
+                            let (w, h) = self.pane_area_size();
+                            let Some(renderer) = self.renderer_ref() else { return };
+                            let mut state = self.state.lock().unwrap();
+                            let new_pane = state.create_new_tab(renderer, w, h);
+                            drop(state);
+                            start_reader(new_pane, &self.state);
+                            return;
+                        }
+                        Key::Named(NamedKey::Tab) => {
+                            let mut state = self.state.lock().unwrap();
+                            state.switch_tab_next();
+                            return;
+                        }
+                        Key::Character(s) => {
+                            // Ctrl+1..9 → switch to tab index (0..8)
+                            if let Some(c) = s.chars().next()
+                                && let Some(d) = c.to_digit(10)
+                                && (1..=9).contains(&d)
+                            {
+                                let mut state = self.state.lock().unwrap();
+                                state.switch_tab_to_index((d - 1) as usize);
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Split / close / prev-tab — Ctrl+Shift chord
                 if ctrl_shift {
                     match &event.logical_key {
                         Key::Character(s) if s.as_str() == "D" || s.as_str() == "d" => {
-                            let (w, h) = self.win_size();
+                            let (w, h) = self.pane_area_size();
                             let Some(renderer) = self.renderer_ref() else { return };
                             let mut state = self.state.lock().unwrap();
                             state.split(SplitDirection::Horizontal, renderer, w, h);
-                            // Find new pane and start reader
-                            let new_ids: Vec<PaneId> = state.tree.pane_ids();
+                            let new_ids: Vec<PaneId> = state.tabs.active().tree.pane_ids();
                             drop(state);
                             for id in new_ids {
-                                let has_reader = self
+                                let needs_reader = self
                                     .state
                                     .lock()
                                     .unwrap()
                                     .panes
                                     .get(&id)
-                                    .map(|ps| !ps.pty.has_reader())
-                                    .unwrap_or(true);
-                                if !has_reader {
+                                    .map(|ps| ps.pty.has_reader())
+                                    .unwrap_or(false);
+                                if needs_reader {
                                     start_reader(id, &self.state);
                                 }
                             }
                             return;
                         }
                         Key::Character(s) if s.as_str() == "E" || s.as_str() == "e" => {
-                            let (w, h) = self.win_size();
+                            let (w, h) = self.pane_area_size();
                             let Some(renderer) = self.renderer_ref() else { return };
                             let mut state = self.state.lock().unwrap();
                             state.split(SplitDirection::Vertical, renderer, w, h);
-                            let new_ids: Vec<PaneId> = state.tree.pane_ids();
+                            let new_ids: Vec<PaneId> = state.tabs.active().tree.pane_ids();
                             drop(state);
                             for id in new_ids {
-                                let has_reader = self
+                                let needs_reader = self
                                     .state
                                     .lock()
                                     .unwrap()
                                     .panes
                                     .get(&id)
-                                    .map(|ps| !ps.pty.has_reader())
-                                    .unwrap_or(true);
-                                if !has_reader {
+                                    .map(|ps| ps.pty.has_reader())
+                                    .unwrap_or(false);
+                                if needs_reader {
                                     start_reader(id, &self.state);
                                 }
                             }
@@ -390,56 +535,54 @@ impl ApplicationHandler for App {
                         }
                         Key::Character(s) if s.as_str() == "W" || s.as_str() == "w" => {
                             let mut state = self.state.lock().unwrap();
-                            state.close_focused();
+                            state.close_active_tab();
+                            return;
+                        }
+                        Key::Character(s) if s.as_str() == "P" || s.as_str() == "p" => {
+                            let mut state = self.state.lock().unwrap();
+                            state.close_focused_pane();
+                            return;
+                        }
+                        Key::Named(NamedKey::Tab) => {
+                            let mut state = self.state.lock().unwrap();
+                            state.switch_tab_prev();
                             return;
                         }
                         _ => {}
                     }
                 }
 
-                // Focus navigation
+                // Pane focus navigation — Alt+Arrow
                 if alt {
-                    let (w, h) = self.win_size();
+                    let (w, h) = self.pane_area_size();
                     let mut state = self.state.lock().unwrap();
-                    let moved = match &event.logical_key {
-                        Key::Named(NamedKey::ArrowRight) => state.tree.find_adjacent(
-                            state.focused,
-                            SplitDirection::Horizontal,
-                            true,
-                            w,
-                            h,
-                        ),
-                        Key::Named(NamedKey::ArrowLeft) => state.tree.find_adjacent(
-                            state.focused,
-                            SplitDirection::Horizontal,
-                            false,
-                            w,
-                            h,
-                        ),
-                        Key::Named(NamedKey::ArrowDown) => state.tree.find_adjacent(
-                            state.focused,
-                            SplitDirection::Vertical,
-                            true,
-                            w,
-                            h,
-                        ),
-                        Key::Named(NamedKey::ArrowUp) => state.tree.find_adjacent(
-                            state.focused,
-                            SplitDirection::Vertical,
-                            false,
-                            w,
-                            h,
-                        ),
-                        _ => None,
+                    let focused = state.focused_pane();
+                    let moved = {
+                        let tab = state.tabs.active();
+                        match &event.logical_key {
+                            Key::Named(NamedKey::ArrowRight) => tab
+                                .tree
+                                .find_adjacent(focused, SplitDirection::Horizontal, true, w, h),
+                            Key::Named(NamedKey::ArrowLeft) => tab
+                                .tree
+                                .find_adjacent(focused, SplitDirection::Horizontal, false, w, h),
+                            Key::Named(NamedKey::ArrowDown) => tab
+                                .tree
+                                .find_adjacent(focused, SplitDirection::Vertical, true, w, h),
+                            Key::Named(NamedKey::ArrowUp) => tab
+                                .tree
+                                .find_adjacent(focused, SplitDirection::Vertical, false, w, h),
+                            _ => None,
+                        }
                     };
                     if let Some(new_focus) = moved {
-                        state.focused = new_focus;
+                        state.tabs.active_mut().focused_pane = new_focus;
                         state.dirty = true;
                     }
                     return;
                 }
 
-                // Normal key input → focused pane
+                // Normal key input → focused pane in active tab
                 let bytes: Vec<u8> = match &event.logical_key {
                     Key::Character(s) => s.as_bytes().to_vec(),
                     Key::Named(NamedKey::Enter) => vec![b'\r'],
@@ -454,7 +597,7 @@ impl ApplicationHandler for App {
                 };
 
                 let mut state = self.state.lock().unwrap();
-                let focused = state.focused;
+                let focused = state.focused_pane();
                 let mut snap_dirty = false;
                 if let Some(ps) = state.panes.get_mut(&focused) {
                     // Snap viewport back to live content on user input.
@@ -474,10 +617,8 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let needs_redraw = self.state.lock().unwrap().dirty;
-        if needs_redraw {
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
+        if needs_redraw && let Some(w) = &self.window {
+            w.request_redraw();
         }
         // Poll dirty flag at ~60Hz so PTY reader thread output reaches the
         // screen without an EventLoopProxy.  TODO: switch to EventLoopProxy.
