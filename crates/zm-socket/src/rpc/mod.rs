@@ -19,8 +19,12 @@
 //! Phase 2.1.A scope: types only. Handler / transport / server come in
 //! MIN-D2 / MIN-D3.
 
+mod handler_min;
 mod types;
 
+pub use handler_min::{
+    BackendHandler, CONTEXT_NOT_FOUND, ContextEntry, ContextRegistry, MinimalHandler, dispatch,
+};
 pub use types::{
     CaptureParams, CaptureResult, ContextExitedParams, ContextId, ContextInfo, ContextStatus,
     InitParams, InitResult, JSONRPC_VERSION, KillParams, ListParams, ListResult, Notification,
