@@ -10,3 +10,4 @@ zm-core = { path = "../zm-core" }
 zm-term = { path = "../zm-term" }
 softbuffer = "0.4"
 cosmic-text = "0.19"
+winit = "0.30"

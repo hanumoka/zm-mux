@@ -1,8 +1,6 @@
 use portable_pty::CommandBuilder;
-use softbuffer::Surface;
 use std::collections::HashMap;
 use std::io::Read;
-use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
@@ -13,7 +11,7 @@ use winit::window::{Window, WindowId};
 use zm_core::Config;
 use zm_mux::{PaneId, PaneTree, SplitDirection};
 use zm_pty::ZmPtyProcess;
-use zm_render::{CpuRenderer, PaneRenderInfo, Rect};
+use zm_render::{PaneRenderInfo, Rect, Renderer, create_renderer};
 use zm_term::ZmTerm;
 
 const INITIAL_COLS: u16 = 80;
@@ -50,7 +48,7 @@ impl MuxState {
     fn split(
         &mut self,
         direction: SplitDirection,
-        renderer: &CpuRenderer,
+        renderer: &dyn Renderer,
         win_width: usize,
         win_height: usize,
     ) {
@@ -83,7 +81,7 @@ impl MuxState {
         }
     }
 
-    fn resize_all_panes(&mut self, renderer: &CpuRenderer, win_width: usize, win_height: usize) {
+    fn resize_all_panes(&mut self, renderer: &dyn Renderer, win_width: usize, win_height: usize) {
         let layouts = self.tree.layout(win_width, win_height);
         for (id, rect) in &layouts {
             if let Some(ps) = self.panes.get_mut(id) {
@@ -144,50 +142,43 @@ fn start_reader(pane_id: PaneId, state: &Arc<Mutex<MuxState>>) {
 
 struct App {
     window: Option<Arc<Window>>,
-    context: Option<softbuffer::Context<Arc<Window>>>,
-    surface: Option<Surface<Arc<Window>, Arc<Window>>>,
-    renderer: CpuRenderer,
+    renderer: Option<Box<dyn Renderer>>,
     state: Arc<Mutex<MuxState>>,
     modifiers: ModifiersState,
+    config: Config,
 }
 
 impl App {
-    fn new(renderer: CpuRenderer, state: Arc<Mutex<MuxState>>) -> Self {
+    fn new(state: Arc<Mutex<MuxState>>, config: Config) -> Self {
         Self {
             window: None,
-            context: None,
-            surface: None,
-            renderer,
+            renderer: None,
             state,
             modifiers: ModifiersState::empty(),
+            config,
         }
+    }
+
+    fn renderer_ref(&self) -> Option<&(dyn Renderer + '_)> {
+        self.renderer.as_deref()
     }
 
     fn redraw(&mut self) {
         let Some(window) = &self.window else { return };
-        let Some(surface) = &mut self.surface else {
-            return;
-        };
-
-        let mut state = self.state.lock().unwrap();
         let size = window.inner_size();
-        let width = size.width as usize;
-        let height = size.height as usize;
+        let width = size.width;
+        let height = size.height;
 
         if width == 0 || height == 0 {
             return;
         }
 
+        let mut state = self.state.lock().unwrap();
         if !state.dirty {
             return;
         }
 
-        let _ = surface.resize(
-            NonZeroU32::new(size.width).unwrap(),
-            NonZeroU32::new(size.height).unwrap(),
-        );
-
-        let layouts = state.tree.layout(width, height);
+        let layouts = state.tree.layout(width as usize, height as usize);
         let pane_infos: Vec<PaneRenderInfo> = layouts
             .iter()
             .filter_map(|(id, mux_rect)| {
@@ -204,11 +195,12 @@ impl App {
             })
             .collect();
 
-        let mut buffer = surface.buffer_mut().unwrap();
-        let buf_slice: &mut [u32] = &mut buffer;
-        self.renderer
-            .render_panes(&pane_infos, buf_slice, width, height);
-        let _ = buffer.present();
+        let Some(renderer) = self.renderer.as_deref_mut() else {
+            return;
+        };
+        if let Err(e) = renderer.render(&pane_infos, width, height) {
+            eprintln!("render error: {e}");
+        }
 
         state.dirty = false;
     }
@@ -230,22 +222,36 @@ impl ApplicationHandler for App {
             return;
         }
 
-        let (req_w, req_h) = self
-            .renderer
-            .required_size(INITIAL_COLS as usize, INITIAL_ROWS as usize);
+        // Two-phase initialization: window must exist before the renderer's
+        // surface can bind to it.  We open at a placeholder size, then ask
+        // the platform to resize once we know the real cell metrics.
+        // Approximate cell pixels for the initial open: avoids one extra
+        // resize round-trip in the common case.
+        let initial_cell_w = (self.config.font.size * 0.6).ceil() as u32;
+        let initial_cell_h = (self.config.font.size * 1.4).ceil() as u32;
+        let initial_w = initial_cell_w * INITIAL_COLS as u32;
+        let initial_h = initial_cell_h * INITIAL_ROWS as u32;
 
         let attrs = Window::default_attributes()
             .with_title("zm-mux")
-            .with_inner_size(winit::dpi::PhysicalSize::new(req_w as u32, req_h as u32));
+            .with_inner_size(winit::dpi::PhysicalSize::new(initial_w, initial_h));
 
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
-        self.context = Some(context);
-        let surface = Surface::new(self.context.as_ref().unwrap(), window.clone())
-            .expect("softbuffer surface");
+
+        let renderer = create_renderer(
+            window.clone(),
+            self.config.font.size,
+            &self.config.font.family,
+        )
+        .expect("renderer init");
+
+        // Snap window to exact cell-metric size now that we have a real
+        // shaper.  Platform may ignore this on Wayland; benign either way.
+        let (req_w, req_h) = renderer.required_size(INITIAL_COLS as usize, INITIAL_ROWS as usize);
+        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(req_w as u32, req_h as u32));
 
         self.window = Some(window);
-        self.surface = Some(surface);
+        self.renderer = Some(renderer);
 
         // Start reader for initial pane
         let root = self.state.lock().unwrap().tree.root_pane();
@@ -280,10 +286,11 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(_) => {
                 let (w, h) = self.win_size();
-                let mut state = self.state.lock().unwrap();
-                state.resize_all_panes(&self.renderer, w, h);
-                state.dirty = true;
-                drop(state);
+                if let Some(renderer) = self.renderer_ref() {
+                    let mut state = self.state.lock().unwrap();
+                    state.resize_all_panes(renderer, w, h);
+                    state.dirty = true;
+                }
                 if let Some(win) = &self.window {
                     win.request_redraw();
                 }
@@ -338,8 +345,9 @@ impl ApplicationHandler for App {
                     match &event.logical_key {
                         Key::Character(s) if s.as_str() == "D" || s.as_str() == "d" => {
                             let (w, h) = self.win_size();
+                            let Some(renderer) = self.renderer_ref() else { return };
                             let mut state = self.state.lock().unwrap();
-                            state.split(SplitDirection::Horizontal, &self.renderer, w, h);
+                            state.split(SplitDirection::Horizontal, renderer, w, h);
                             // Find new pane and start reader
                             let new_ids: Vec<PaneId> = state.tree.pane_ids();
                             drop(state);
@@ -360,8 +368,9 @@ impl ApplicationHandler for App {
                         }
                         Key::Character(s) if s.as_str() == "E" || s.as_str() == "e" => {
                             let (w, h) = self.win_size();
+                            let Some(renderer) = self.renderer_ref() else { return };
                             let mut state = self.state.lock().unwrap();
-                            state.split(SplitDirection::Vertical, &self.renderer, w, h);
+                            state.split(SplitDirection::Vertical, renderer, w, h);
                             let new_ids: Vec<PaneId> = state.tree.pane_ids();
                             drop(state);
                             for id in new_ids {
@@ -480,11 +489,9 @@ impl ApplicationHandler for App {
 
 fn main() {
     let config = Config::load();
-    let renderer =
-        CpuRenderer::new(config.font.size, &config.font.family).expect("renderer init");
     let state = Arc::new(Mutex::new(MuxState::new()));
 
     let event_loop = EventLoop::new().expect("event loop");
-    let mut app = App::new(renderer, state);
+    let mut app = App::new(state, config);
     let _ = event_loop.run_app(&mut app);
 }

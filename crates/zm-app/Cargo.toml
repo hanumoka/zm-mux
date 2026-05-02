@@ -14,5 +14,4 @@ zm-mux = { path = "../zm-mux" }
 zm-agent = { path = "../zm-agent" }
 zm-socket = { path = "../zm-socket" }
 winit = "0.30"
-softbuffer = "0.4"
 portable-pty = "0.9"
