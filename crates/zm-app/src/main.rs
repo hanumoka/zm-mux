@@ -1,3 +1,5 @@
+mod notify;
+
 use portable_pty::CommandBuilder;
 use std::collections::HashMap;
 use std::io::Read;
@@ -16,7 +18,9 @@ use zm_pty::ZmPtyProcess;
 use zm_render::{
     PaneRenderInfo, Rect, Renderer, TAB_BAR_HEIGHT_PX, TabBarInfo, TabLabel, create_renderer,
 };
-use zm_term::ZmTerm;
+use zm_term::{OscEvent, ZmTerm};
+
+use crate::notify::NotifyDispatcher;
 
 const INITIAL_COLS: u16 = 80;
 const INITIAL_ROWS: u16 = 24;
@@ -278,6 +282,8 @@ struct App {
     modifiers: ModifiersState,
     config: Config,
     keybindings: ParsedKeyBindings,
+    notifier: NotifyDispatcher,
+    notify_gc_counter: u32,
 }
 
 impl App {
@@ -293,6 +299,8 @@ impl App {
             modifiers: ModifiersState::empty(),
             config,
             keybindings,
+            notifier: NotifyDispatcher::new(),
+            notify_gc_counter: 0,
         }
     }
 
@@ -633,6 +641,27 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Drain OSC notification events from every pane and forward to the
+        // throttled OS dispatcher.  Done here (the 16ms idle tick) rather
+        // than inside the PTY reader thread so notify-rust is only ever
+        // called from the main thread (Win toast API thread-affinity).
+        let osc_events: Vec<OscEvent> = {
+            let state = self.state.lock().unwrap();
+            state
+                .panes
+                .values()
+                .flat_map(|ps| ps.term.drain_osc_events())
+                .collect()
+        };
+        for ev in &osc_events {
+            self.notifier.dispatch(ev);
+        }
+        // Periodic dedup-table sweep — every ~16s (1000 ticks * 16ms).
+        self.notify_gc_counter = self.notify_gc_counter.wrapping_add(1);
+        if self.notify_gc_counter.is_multiple_of(1000) {
+            self.notifier.gc();
+        }
+
         let needs_redraw = self.state.lock().unwrap().dirty;
         if needs_redraw && let Some(w) = &self.window {
             w.request_redraw();

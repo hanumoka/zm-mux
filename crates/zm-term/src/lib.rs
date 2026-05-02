@@ -4,6 +4,7 @@ use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::term::Term;
 use alacritty_terminal::vte::ansi;
 use std::sync::{Arc, Mutex};
+use vte::{Parser as VteParser, Perform as VtePerform};
 use zm_core::ZmResult;
 
 #[derive(Clone)]
@@ -33,6 +34,91 @@ impl EventListener for EventCollector {
     fn send_event(&self, event: Event) {
         if let Ok(mut events) = self.events.lock() {
             events.push(event);
+        }
+    }
+}
+
+/// OSC events we sniff out of the byte stream because alacritty_terminal
+/// does not surface them through its EventListener.  Right now this is the
+/// notification family (OSC 9 — iTerm style, OSC 777 — urxvt style).  OSC
+/// 99 (KDE D-Bus) and OSC 8 (hyperlinks) live elsewhere and are deferred
+/// to follow-up tasks.
+#[derive(Debug, Clone)]
+pub enum OscEventKind {
+    Notify { title: String, body: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct OscEvent {
+    pub kind: OscEventKind,
+}
+
+/// Sniffs OSC 9 / 777 sequences out of a parallel `vte::Parser` running
+/// alongside alacritty's parser.  All other OSC codes are silently
+/// ignored — alacritty handles the ones it cares about (title, color,
+/// clipboard).  Cost: a second pass over the same bytes; for terminal
+/// throughput this is negligible (byte-level state machine).
+pub struct OscDispatcher {
+    events: Arc<Mutex<Vec<OscEvent>>>,
+}
+
+impl OscDispatcher {
+    pub fn new() -> Self {
+        Self {
+            events: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn shared(&self) -> Arc<Mutex<Vec<OscEvent>>> {
+        self.events.clone()
+    }
+
+    fn push(&self, ev: OscEvent) {
+        if let Ok(mut events) = self.events.lock() {
+            events.push(ev);
+        }
+    }
+}
+
+impl Default for OscDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VtePerform for OscDispatcher {
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if params.is_empty() {
+            return;
+        }
+        let code = match std::str::from_utf8(params[0]) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        match code {
+            // OSC 9;<body>BEL  (iTerm2 / Terminal.app growl-style notify)
+            "9" => {
+                if let Some(body_bytes) = params.get(1) {
+                    let body = String::from_utf8_lossy(body_bytes).into_owned();
+                    if !body.is_empty() {
+                        self.push(OscEvent {
+                            kind: OscEventKind::Notify {
+                                title: "zm-mux".to_string(),
+                                body,
+                            },
+                        });
+                    }
+                }
+            }
+            // OSC 777;notify;<title>;<body>BEL  (urxvt-style)
+            "777" if params.len() >= 4 && params[1] == b"notify" => {
+                let title = String::from_utf8_lossy(params[2]).into_owned();
+                let body = String::from_utf8_lossy(params[3]).into_owned();
+                self.push(OscEvent {
+                    kind: OscEventKind::Notify { title, body },
+                });
+            }
+            _ => {}
         }
     }
 }
@@ -98,7 +184,10 @@ impl Default for RenderCell {
 pub struct ZmTerm {
     term: Term<EventCollector>,
     parser: ansi::Processor,
+    osc_parser: VteParser,
+    osc_dispatcher: OscDispatcher,
     events: Arc<Mutex<Vec<Event>>>,
+    osc_events: Arc<Mutex<Vec<OscEvent>>>,
 }
 
 impl ZmTerm {
@@ -109,16 +198,25 @@ impl ZmTerm {
         let events = event_collector.shared();
         let term = Term::new(config, &size, event_collector);
         let parser = ansi::Processor::new();
+        let osc_dispatcher = OscDispatcher::new();
+        let osc_events = osc_dispatcher.shared();
+        let osc_parser = VteParser::new();
 
         Ok(Self {
             term,
             parser,
+            osc_parser,
+            osc_dispatcher,
             events,
+            osc_events,
         })
     }
 
     pub fn feed_bytes(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
+        // Run the same bytes through our OSC sniffer.  Side effects feed
+        // into self.osc_events; alacritty's grid state is unaffected.
+        self.osc_parser.advance(&mut self.osc_dispatcher, bytes);
     }
 
     /// Drain bytes that the terminal needs to send back to the PTY in response
@@ -139,6 +237,16 @@ impl ZmTerm {
         }
         *events = keep;
         out
+    }
+
+    /// Drain OSC notification events accumulated since the last call.  Caller
+    /// is expected to throttle / dedup before forwarding to the OS notifier.
+    pub fn drain_osc_events(&self) -> Vec<OscEvent> {
+        let mut events = match self.osc_events.lock() {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+        events.drain(..).collect()
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -394,5 +502,69 @@ mod tests {
         let cell = term.render_cell(0, 0);
         assert_eq!(cell.c, 'B');
         assert!(cell.bold, "Should be bold");
+    }
+
+    #[test]
+    fn osc_9_emits_notify_event() {
+        let mut term = ZmTerm::new(80, 24).unwrap();
+        term.feed_bytes(b"\x1b]9;Hello world\x07");
+        let events = term.drain_osc_events();
+        assert_eq!(events.len(), 1);
+        match &events[0].kind {
+            OscEventKind::Notify { title, body } => {
+                assert_eq!(title, "zm-mux");
+                assert_eq!(body, "Hello world");
+            }
+        }
+    }
+
+    #[test]
+    fn osc_777_notify_emits_event() {
+        let mut term = ZmTerm::new(80, 24).unwrap();
+        term.feed_bytes(b"\x1b]777;notify;ZM Title;Hello\x07");
+        let events = term.drain_osc_events();
+        assert_eq!(events.len(), 1);
+        match &events[0].kind {
+            OscEventKind::Notify { title, body } => {
+                assert_eq!(title, "ZM Title");
+                assert_eq!(body, "Hello");
+            }
+        }
+    }
+
+    #[test]
+    fn osc_unrelated_codes_ignored() {
+        let mut term = ZmTerm::new(80, 24).unwrap();
+        // OSC 0 = title set; not notify, must not surface as OscEvent.
+        term.feed_bytes(b"\x1b]0;set title\x07");
+        let events = term.drain_osc_events();
+        assert!(events.is_empty(), "got: {events:?}");
+    }
+
+    #[test]
+    fn osc_9_empty_body_ignored() {
+        let mut term = ZmTerm::new(80, 24).unwrap();
+        term.feed_bytes(b"\x1b]9;\x07");
+        let events = term.drain_osc_events();
+        assert!(events.is_empty(), "empty OSC 9 should not emit");
+    }
+
+    #[test]
+    fn drain_clears_buffer() {
+        let mut term = ZmTerm::new(80, 24).unwrap();
+        term.feed_bytes(b"\x1b]9;a\x07\x1b]9;b\x07");
+        let events1 = term.drain_osc_events();
+        assert_eq!(events1.len(), 2);
+        let events2 = term.drain_osc_events();
+        assert!(events2.is_empty());
+    }
+
+    #[test]
+    fn osc_777_short_form_ignored() {
+        let mut term = ZmTerm::new(80, 24).unwrap();
+        // urxvt OSC 777 with non-"notify" subtype — out of our scope.
+        term.feed_bytes(b"\x1b]777;set;something\x07");
+        let events = term.drain_osc_events();
+        assert!(events.is_empty());
     }
 }

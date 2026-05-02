@@ -15,3 +15,4 @@ zm-agent = { path = "../zm-agent" }
 zm-socket = { path = "../zm-socket" }
 winit = "0.30"
 portable-pty = "0.9"
+notify-rust = "4"
