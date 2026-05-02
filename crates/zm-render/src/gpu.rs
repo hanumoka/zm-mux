@@ -8,6 +8,7 @@ use glyphon::{Cache, Color, Resolution, SwashCache, TextArea, TextAtlas, TextBou
 use winit::window::Window;
 use zm_core::{ZmError, ZmResult};
 
+use crate::gpu_rect::{push_rect, RectPipeline, RectVertex};
 use crate::{PaneRenderInfo, Renderer};
 
 const JETBRAINS_MONO_REGULAR: &[u8] =
@@ -21,6 +22,11 @@ const BG_OUTSIDE_SRGB: (u8, u8, u8) = (0x1a, 0x1a, 0x2e);
 const DEFAULT_FG_R: u8 = 0xCC;
 const DEFAULT_FG_G: u8 = 0xCC;
 const DEFAULT_FG_B: u8 = 0xCC;
+
+// Cursor outline + pane border colors (sRGB; converted to linear at draw time).
+const CURSOR_SRGB: (u8, u8, u8) = (0xCC, 0xCC, 0xCC);
+const BORDER_FOCUSED_SRGB: (u8, u8, u8) = (0x44, 0x88, 0xFF);
+const BORDER_UNFOCUSED_SRGB: (u8, u8, u8) = (0x44, 0x44, 0x44);
 
 /// GPU-accelerated renderer using wgpu + glyphon.
 ///
@@ -45,6 +51,7 @@ pub struct GpuBackend {
     viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
+    rect_pipeline: RectPipeline,
 }
 
 impl GpuBackend {
@@ -104,6 +111,7 @@ impl GpuBackend {
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
+        let rect_pipeline = RectPipeline::new(&device, format);
 
         let font_family = font_family.into();
         let line_height = (font_size * 1.4).ceil();
@@ -139,6 +147,7 @@ impl GpuBackend {
             viewport,
             atlas,
             text_renderer,
+            rect_pipeline,
         })
     }
 }
@@ -291,6 +300,127 @@ impl Renderer for GpuBackend {
             )
             .map_err(|e| ZmError::Render(format!("glyphon prepare: {e}")))?;
 
+        // Build rect vertex list: cursor outline (4 thin rects) + pane border
+        // (4 thin rects) for each pane.  Colors converted to linear once
+        // since the surface is sRGB.
+        let cursor_color = [
+            srgb_byte_to_linear(CURSOR_SRGB.0) as f32,
+            srgb_byte_to_linear(CURSOR_SRGB.1) as f32,
+            srgb_byte_to_linear(CURSOR_SRGB.2) as f32,
+            1.0,
+        ];
+        let border_focused = [
+            srgb_byte_to_linear(BORDER_FOCUSED_SRGB.0) as f32,
+            srgb_byte_to_linear(BORDER_FOCUSED_SRGB.1) as f32,
+            srgb_byte_to_linear(BORDER_FOCUSED_SRGB.2) as f32,
+            1.0,
+        ];
+        let border_unfocused = [
+            srgb_byte_to_linear(BORDER_UNFOCUSED_SRGB.0) as f32,
+            srgb_byte_to_linear(BORDER_UNFOCUSED_SRGB.1) as f32,
+            srgb_byte_to_linear(BORDER_UNFOCUSED_SRGB.2) as f32,
+            1.0,
+        ];
+        let mut rect_verts: Vec<RectVertex> = Vec::new();
+        for pane in panes {
+            let r = &pane.rect;
+            let term = pane.term;
+
+            // Pane border (1px lines just outside the pane rect).
+            let border = if pane.focused {
+                border_focused
+            } else {
+                border_unfocused
+            };
+            // Top
+            push_rect(
+                &mut rect_verts,
+                r.x as i32,
+                r.y as i32 - 1,
+                r.width as i32,
+                1,
+                border,
+                width,
+                height,
+            );
+            // Bottom
+            push_rect(
+                &mut rect_verts,
+                r.x as i32,
+                (r.y + r.height) as i32,
+                r.width as i32,
+                1,
+                border,
+                width,
+                height,
+            );
+            // Left
+            push_rect(
+                &mut rect_verts,
+                r.x as i32 - 1,
+                r.y as i32,
+                1,
+                r.height as i32,
+                border,
+                width,
+                height,
+            );
+            // Right
+            push_rect(
+                &mut rect_verts,
+                (r.x + r.width) as i32,
+                r.y as i32,
+                1,
+                r.height as i32,
+                border,
+                width,
+                height,
+            );
+
+            // Cursor outline (only when viewport is at live content).
+            if term.display_offset() == 0 {
+                let (crow, ccol) = term.cursor_position();
+                if crow < term.rows() && ccol < term.cols() {
+                    let cx = r.x as i32 + ccol as i32 * self.cell_width as i32;
+                    let cy = r.y as i32 + crow as i32 * self.cell_height as i32;
+                    let cw = self.cell_width as i32;
+                    let ch = self.cell_height as i32;
+                    // Top edge
+                    push_rect(&mut rect_verts, cx, cy, cw, 1, cursor_color, width, height);
+                    // Bottom edge
+                    push_rect(
+                        &mut rect_verts,
+                        cx,
+                        cy + ch - 1,
+                        cw,
+                        1,
+                        cursor_color,
+                        width,
+                        height,
+                    );
+                    // Left edge
+                    push_rect(&mut rect_verts, cx, cy, 1, ch, cursor_color, width, height);
+                    // Right edge
+                    push_rect(
+                        &mut rect_verts,
+                        cx + cw - 1,
+                        cy,
+                        1,
+                        ch,
+                        cursor_color,
+                        width,
+                        height,
+                    );
+                }
+            }
+        }
+
+        let rect_buffer = if rect_verts.is_empty() {
+            None
+        } else {
+            Some(self.rect_pipeline.build_buffer(&self.device, &rect_verts))
+        };
+
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             other => {
@@ -333,7 +463,9 @@ impl Renderer for GpuBackend {
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .map_err(|e| ZmError::Render(format!("glyphon render: {e}")))?;
-            // TODO 1.3.9-B-3: cursor + pane border via solid-color rect shader
+            if let Some(ref buf) = rect_buffer {
+                self.rect_pipeline.draw(&mut pass, buf, rect_verts.len() as u32);
+            }
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();

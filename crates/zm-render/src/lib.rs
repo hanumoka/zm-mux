@@ -6,6 +6,7 @@ use zm_term::ZmTerm;
 
 mod cpu;
 mod gpu;
+mod gpu_rect;
 
 pub use cpu::CpuBackend;
 pub use gpu::GpuBackend;
