@@ -47,3 +47,9 @@
 - **실수**: 셀 크기(픽셀) × cols/rows 결과를 `LogicalSize::new(...)` 에 넘김 → DPI 1.25/1.5x 환경에서 윈도우가 25~50% 더 크게 뜸 (`452ce1c` 첫 스크린샷의 거대 윈도우 원인)
 - **올바른 방법**: 픽셀 단위면 `PhysicalSize::new(...)`. `LogicalSize` 는 DPI 미적용 좌표일 때만.
 - **탐지**: `LogicalSize::new\([^)]*\b(cell|pixel|width|height|req_w|req_h)\b`
+
+### M-008 [WARN] cosmic-text 메이저 버전을 통합 크레이트(glyphon 등)와 lockstep 없이 올림
+
+- **실수**: `cosmic-text = "0.19"` 같은 직접 의존을 통합 크레이트(`glyphon`, `iced`, 그 외 cosmic 종속)가 받을 수 있는 버전보다 앞서 올림 → 두 cosmic-text 인스턴스가 graph 에 공존하는데 타입(`Buffer`, `FontSystem`)이 서로 호환 안 됨 → 통합 크레이트로 buffer 를 넘기는 순간 컴파일 실패. (`aa18eed` 1.3.9-B-1 에서 cosmic-text 0.19 → 0.18 다운그레이드로 해소)
+- **올바른 방법**: cosmic-text 의존을 직접 두기 전에 **함께 쓸 통합 크레이트의 Cargo.toml 에서 cosmic-text 버전 핀**을 먼저 확인하고 그것에 맞춤. 통합 크레이트가 새 cosmic-text 를 받을 때까지 직접 의존을 올리지 않음.
+- **탐지**: `cosmic-text\s*=` 와 함께 `glyphon\s*=` 또는 `iced\s*=` 가 같은 워크스페이스에 있을 때 두 의존이 서로 다른 cosmic-text 버전 범위를 가리키면 경고
