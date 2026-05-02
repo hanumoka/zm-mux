@@ -248,6 +248,30 @@ fn winit_mods_to_bits(m: ModifiersState) -> ModBits {
     b
 }
 
+/// Encode `ModBits` as a Kitty keyboard-protocol modifier mask (CSI u).
+/// Spec: shift=1, alt=2, ctrl=4, super=8; the wire value is `mask + 1`
+/// (the +1 distinguishes "no modifiers" = 1 from an omitted field).
+///
+/// portable-pty 0.9 already sets `PSEUDOCONSOLE_WIN32_INPUT_MODE` on
+/// every ConPTY it creates, so on Windows the kernel side is ready to
+/// receive these sequences without any extra setup on our end.
+fn kitty_modifier_mask(mods: ModBits) -> u8 {
+    let mut k = 0u8;
+    if mods.contains(ModBits::SHIFT) {
+        k |= 1;
+    }
+    if mods.contains(ModBits::ALT) {
+        k |= 2;
+    }
+    if mods.contains(ModBits::CTRL) {
+        k |= 4;
+    }
+    if mods.contains(ModBits::SUPER) {
+        k |= 8;
+    }
+    k + 1
+}
+
 /// Map a winit logical key to the keybinding-friendly subset.  Returns None
 /// for keys we never bind (function keys, media keys, dead keys, etc.).
 fn winit_key_to_def(key: &Key) -> Option<KeyDef> {
@@ -611,7 +635,21 @@ impl ApplicationHandler for App {
                 // Plain key input → focused pane in active tab.
                 let bytes: Vec<u8> = match &event.logical_key {
                     Key::Character(s) => s.as_bytes().to_vec(),
-                    Key::Named(NamedKey::Enter) => vec![b'\r'],
+                    Key::Named(NamedKey::Enter) => {
+                        // Bare Enter → plain CR (every terminal app understands it).
+                        // Modifier+Enter → Kitty CSI u sequence so apps that
+                        // negotiate the protocol (claude code, neovim with
+                        // unicode-keyboard, modern editors) can distinguish
+                        // Shift/Ctrl/Alt/Super + Enter from a plain newline.
+                        // Apps that did NOT negotiate will print this as
+                        // garbled text, which is the standard fallback.
+                        if mods_bits == ModBits::EMPTY {
+                            vec![b'\r']
+                        } else {
+                            let mask = kitty_modifier_mask(mods_bits);
+                            format!("\x1b[13;{mask}u").into_bytes()
+                        }
+                    }
                     Key::Named(NamedKey::Backspace) => vec![0x7f],
                     Key::Named(NamedKey::Tab) => vec![b'\t'],
                     Key::Named(NamedKey::Escape) => vec![0x1b],
