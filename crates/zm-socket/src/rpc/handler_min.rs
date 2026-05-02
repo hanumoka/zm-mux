@@ -41,8 +41,10 @@ use crate::rpc::types::{
 pub const CONTEXT_NOT_FOUND: i32 = -32000;
 
 /// Trait shared by minimal and (future) real handlers. Each method maps 1:1
-/// to a JSON-RPC method on the wire. Notifications (server→client) are
-/// emitted via the implementation's own surface, not through this trait.
+/// to a JSON-RPC method on the wire, plus a `drain_notifications` poll for
+/// the server→client `context_exited` push. The transport layer (MIN-D3)
+/// is generic over this trait so a real handler can be swapped in without
+/// touching the dispatch / framing code.
 pub trait BackendHandler {
     fn handle_initialize(&mut self, params: InitParams) -> Result<InitResult, RpcError>;
     fn handle_spawn_agent(
@@ -53,6 +55,14 @@ pub trait BackendHandler {
     fn handle_capture(&mut self, params: CaptureParams) -> Result<CaptureResult, RpcError>;
     fn handle_kill(&mut self, params: KillParams) -> Result<(), RpcError>;
     fn handle_list(&mut self, params: ListParams) -> Result<ListResult, RpcError>;
+
+    /// Drain server→client notifications buffered on this handler. The
+    /// transport polls this once per dispatch cycle and pushes each
+    /// notification down the wire. Default impl is empty so handlers that
+    /// never emit notifications need not override.
+    fn drain_notifications(&mut self) -> Vec<Notification> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -145,13 +155,6 @@ impl MinimalHandler {
 
     pub fn registry(&self) -> &ContextRegistry {
         &self.registry
-    }
-
-    /// Drain all server→client notifications currently buffered on the
-    /// handler. The transport layer (MIN-D3) will poll this once per
-    /// dispatch cycle and push each notification down the wire.
-    pub fn drain_notifications(&mut self) -> Vec<Notification> {
-        std::mem::take(&mut self.pending_notifications)
     }
 
     /// Synthesize a `context_exited` notification for an already-registered
@@ -258,6 +261,10 @@ impl BackendHandler for MinimalHandler {
         Ok(ListResult {
             contexts: self.registry.snapshot(),
         })
+    }
+
+    fn drain_notifications(&mut self) -> Vec<Notification> {
+        std::mem::take(&mut self.pending_notifications)
     }
 }
 
