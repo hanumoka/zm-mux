@@ -1,5 +1,10 @@
 pub mod config;
-pub use config::{Config, FontConfig};
+pub mod keybinding;
+pub use config::{
+    ColorsConfig, Config, FontConfig, KeyBindingsConfig, ParsedKeyBindings, ScrollbackConfig,
+    ShellConfig,
+};
+pub use keybinding::{KeyBinding, KeyDef, ModBits};
 
 use thiserror::Error;
 

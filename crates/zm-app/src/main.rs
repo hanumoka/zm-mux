@@ -8,7 +8,9 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-use zm_core::Config;
+use zm_core::{
+    Config, KeyBindingsConfig, KeyDef, ModBits, ParsedKeyBindings, ShellConfig,
+};
 use zm_mux::{PaneId, SplitDirection, TabSet};
 use zm_pty::ZmPtyProcess;
 use zm_render::{
@@ -28,12 +30,13 @@ struct MuxState {
     tabs: TabSet,
     panes: HashMap<PaneId, PaneState>,
     dirty: bool,
+    shell_cfg: ShellConfig,
 }
 
 impl MuxState {
-    fn new() -> Self {
+    fn new(shell_cfg: ShellConfig) -> Self {
         let (tabs, initial_pane) = TabSet::new();
-        let pane = create_pane(INITIAL_COLS, INITIAL_ROWS);
+        let pane = create_pane(INITIAL_COLS, INITIAL_ROWS, &shell_cfg);
         let mut panes = HashMap::new();
         panes.insert(initial_pane, pane);
 
@@ -41,6 +44,7 @@ impl MuxState {
             tabs,
             panes,
             dirty: true,
+            shell_cfg,
         }
     }
 
@@ -74,7 +78,7 @@ impl MuxState {
         let layout = layout.unwrap();
         if let Some((_, rect)) = layout.iter().find(|(id, _)| *id == new_id) {
             let (cols, rows) = renderer.cols_rows_for_size(rect.width, rect.height);
-            let pane = create_pane(cols, rows);
+            let pane = create_pane(cols, rows, &self.shell_cfg);
             self.panes.insert(new_id, pane);
             self.resize_all_panes(renderer, win_width, win_height);
             self.dirty = true;
@@ -120,9 +124,6 @@ impl MuxState {
         self.dirty = true;
     }
 
-    /// Create a new tab whose initial pane occupies the full available area
-    /// (caller passes the viewport size used for sizing the PTY).  Returns
-    /// the PaneId of the new tab's first pane so the caller can wire a reader.
     fn create_new_tab(
         &mut self,
         renderer: &dyn Renderer,
@@ -131,7 +132,7 @@ impl MuxState {
     ) -> PaneId {
         let (_tab_id, initial_pane) = self.tabs.create_tab();
         let (cols, rows) = renderer.cols_rows_for_size(win_width, win_height);
-        let pane = create_pane(cols, rows);
+        let pane = create_pane(cols, rows, &self.shell_cfg);
         self.panes.insert(initial_pane, pane);
         self.dirty = true;
         initial_pane
@@ -156,9 +157,6 @@ impl MuxState {
     }
 
     fn resize_all_panes(&mut self, renderer: &dyn Renderer, win_width: usize, win_height: usize) {
-        // Pre-collect every pane's layout across all tabs so the borrow on
-        // self.tabs ends before we touch self.panes.  All tabs share the
-        // same window viewport.
         let all_layouts: Vec<(PaneId, zm_mux::Rect)> = self
             .tabs
             .tabs()
@@ -177,8 +175,16 @@ impl MuxState {
     }
 }
 
-fn create_pane(cols: u16, rows: u16) -> PaneState {
-    let cmd = CommandBuilder::new_default_prog();
+fn create_pane(cols: u16, rows: u16, shell_cfg: &ShellConfig) -> PaneState {
+    let cmd = if shell_cfg.program.is_empty() {
+        CommandBuilder::new_default_prog()
+    } else {
+        let mut c = CommandBuilder::new(&shell_cfg.program);
+        for arg in &shell_cfg.args {
+            c.arg(arg);
+        }
+        c
+    };
     let pty = zm_pty::spawn_pty(rows, cols, cmd).expect("PTY spawn");
     let term = ZmTerm::new(cols, rows).expect("term init");
     PaneState { term, pty }
@@ -204,9 +210,6 @@ fn start_reader(pane_id: PaneId, state: &Arc<Mutex<MuxState>>) {
                         let mut s = state_clone.lock().unwrap();
                         if let Some(ps) = s.panes.get_mut(&pane_id) {
                             ps.term.feed_bytes(&buf[..n]);
-                            // Reply to terminal queries (DSR cursor position, etc.)
-                            // alacritty_terminal emits these as PtyWrite events;
-                            // without forwarding them the shell stalls waiting.
                             for w in ps.term.drain_pty_writes() {
                                 let _ = ps.pty.write_input(&w);
                             }
@@ -222,22 +225,74 @@ fn start_reader(pane_id: PaneId, state: &Arc<Mutex<MuxState>>) {
     }
 }
 
+/// Convert winit modifier flags into zm-core's backend-agnostic ModBits so
+/// keybinding matching stays winit-free.
+fn winit_mods_to_bits(m: ModifiersState) -> ModBits {
+    let mut b = ModBits::empty();
+    if m.contains(ModifiersState::CONTROL) {
+        b |= ModBits::CTRL;
+    }
+    if m.contains(ModifiersState::SHIFT) {
+        b |= ModBits::SHIFT;
+    }
+    if m.contains(ModifiersState::ALT) {
+        b |= ModBits::ALT;
+    }
+    if m.contains(ModifiersState::SUPER) {
+        b |= ModBits::SUPER;
+    }
+    b
+}
+
+/// Map a winit logical key to the keybinding-friendly subset.  Returns None
+/// for keys we never bind (function keys, media keys, dead keys, etc.).
+fn winit_key_to_def(key: &Key) -> Option<KeyDef> {
+    match key {
+        Key::Character(s) => s.chars().next().map(KeyDef::Char),
+        Key::Named(n) => Some(match n {
+            NamedKey::Tab => KeyDef::Tab,
+            NamedKey::Enter => KeyDef::Enter,
+            NamedKey::Escape => KeyDef::Escape,
+            NamedKey::Backspace => KeyDef::Backspace,
+            NamedKey::Space => KeyDef::Space,
+            NamedKey::PageUp => KeyDef::PageUp,
+            NamedKey::PageDown => KeyDef::PageDown,
+            NamedKey::Home => KeyDef::Home,
+            NamedKey::End => KeyDef::End,
+            NamedKey::ArrowUp => KeyDef::ArrowUp,
+            NamedKey::ArrowDown => KeyDef::ArrowDown,
+            NamedKey::ArrowLeft => KeyDef::ArrowLeft,
+            NamedKey::ArrowRight => KeyDef::ArrowRight,
+            _ => return None,
+        }),
+        // Unidentified / Dead keys (IME composition state, raw scancodes
+        // we don't recognize) cannot drive bindings.
+        _ => None,
+    }
+}
+
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Box<dyn Renderer>>,
     state: Arc<Mutex<MuxState>>,
     modifiers: ModifiersState,
     config: Config,
+    keybindings: ParsedKeyBindings,
 }
 
 impl App {
-    fn new(state: Arc<Mutex<MuxState>>, config: Config) -> Self {
+    fn new(
+        state: Arc<Mutex<MuxState>>,
+        config: Config,
+        keybindings: ParsedKeyBindings,
+    ) -> Self {
         Self {
             window: None,
             renderer: None,
             state,
             modifiers: ModifiersState::empty(),
             config,
+            keybindings,
         }
     }
 
@@ -280,8 +335,6 @@ impl App {
             })
             .collect();
 
-        // Tab bar payload — owned title strings so the active-tab borrow
-        // ends before render(), then borrowed labels for the slice handoff.
         let tab_titles: Vec<String> = state
             .tabs
             .tabs()
@@ -313,10 +366,6 @@ impl App {
         state.dirty = false;
     }
 
-    /// Pane viewport size — full window minus the tab bar strip.  Layouts,
-    /// PTY resizes, and split allocations all use this so coordinates inside
-    /// PaneTree are pane-area-relative; the redraw step adds the tab bar
-    /// offset before handing rects to the renderer.
     fn pane_area_size(&self) -> (usize, usize) {
         let (w, h) = self
             .window
@@ -328,6 +377,48 @@ impl App {
             .unwrap_or((800, 600));
         (w, h.saturating_sub(TAB_BAR_HEIGHT_PX as usize))
     }
+
+    /// Helper to dedupe split keybinding handlers (Ctrl+Shift+D / E).
+    /// Spawns a reader for any pane that newly has one.
+    fn do_split(&mut self, direction: SplitDirection) {
+        let (w, h) = self.pane_area_size();
+        let Some(renderer) = self.renderer_ref() else {
+            return;
+        };
+        let new_ids: Vec<PaneId> = {
+            let mut state = self.state.lock().unwrap();
+            state.split(direction, renderer, w, h);
+            state.tabs.active().tree.pane_ids()
+        };
+        for id in new_ids {
+            let needs_reader = self
+                .state
+                .lock()
+                .unwrap()
+                .panes
+                .get(&id)
+                .map(|ps| ps.pty.has_reader())
+                .unwrap_or(false);
+            if needs_reader {
+                start_reader(id, &self.state);
+            }
+        }
+    }
+
+    /// Helper to dedupe focus-direction handlers (Alt+Arrow*).
+    fn do_focus(&self, direction: SplitDirection, forward: bool) {
+        let (w, h) = self.pane_area_size();
+        let mut state = self.state.lock().unwrap();
+        let focused = state.focused_pane();
+        let moved = {
+            let tab = state.tabs.active();
+            tab.tree.find_adjacent(focused, direction, forward, w, h)
+        };
+        if let Some(new_focus) = moved {
+            state.tabs.active_mut().focused_pane = new_focus;
+            state.dirty = true;
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -336,11 +427,6 @@ impl ApplicationHandler for App {
             return;
         }
 
-        // Two-phase initialization: window must exist before the renderer's
-        // surface can bind to it.  We open at a placeholder size, then ask
-        // the platform to resize once we know the real cell metrics.
-        // Approximate cell pixels for the initial open: avoids one extra
-        // resize round-trip in the common case.
         let initial_cell_w = (self.config.font.size * 0.6).ceil() as u32;
         let initial_cell_h = (self.config.font.size * 1.4).ceil() as u32;
         let initial_w = initial_cell_w * INITIAL_COLS as u32;
@@ -359,15 +445,12 @@ impl ApplicationHandler for App {
         )
         .expect("renderer init");
 
-        // Snap window to exact cell-metric size now that we have a real
-        // shaper.  Platform may ignore this on Wayland; benign either way.
         let (req_w, req_h) = renderer.required_size(INITIAL_COLS as usize, INITIAL_ROWS as usize);
         let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(req_w as u32, req_h as u32));
 
         self.window = Some(window);
         self.renderer = Some(renderer);
 
-        // Start reader for initial pane
         let initial = self.state.lock().unwrap().tabs.active().focused_pane;
         start_reader(initial, &self.state);
     }
@@ -414,175 +497,110 @@ impl ApplicationHandler for App {
                     return;
                 }
 
-                let ctrl = self.modifiers.contains(ModifiersState::CONTROL);
-                let shift = self.modifiers.contains(ModifiersState::SHIFT);
-                let alt = self.modifiers.contains(ModifiersState::ALT);
-                let ctrl_only = ctrl && !shift && !alt;
-                let ctrl_shift = ctrl && shift && !alt;
-                let shift_only = shift && !ctrl && !alt;
+                let mods_bits = winit_mods_to_bits(self.modifiers);
+                let key_def = winit_key_to_def(&event.logical_key);
 
-                // Scrollback navigation (Shift+PgUp/PgDn/Home/End)
-                if shift_only {
-                    let mut state = self.state.lock().unwrap();
-                    let focused = state.focused_pane();
-                    let scrolled = if let Some(ps) = state.panes.get_mut(&focused) {
-                        match &event.logical_key {
-                            Key::Named(NamedKey::PageUp) => {
-                                ps.term.scroll_page_up();
-                                true
-                            }
-                            Key::Named(NamedKey::PageDown) => {
-                                ps.term.scroll_page_down();
-                                true
-                            }
-                            Key::Named(NamedKey::Home) => {
-                                ps.term.scroll_to_top();
-                                true
-                            }
-                            Key::Named(NamedKey::End) => {
-                                ps.term.scroll_to_bottom();
-                                true
-                            }
-                            _ => false,
-                        }
-                    } else {
-                        false
+                // Scrollback navigation (Shift+PgUp/PgDn/Home/End) — kept
+                // hardcoded; tightly coupled to scroll API and unlikely to be
+                // user-rebound.
+                if mods_bits == ModBits::SHIFT
+                    && let Some(ref kd) = key_def
+                {
+                    let act = match kd {
+                        KeyDef::PageUp => Some(0u8),
+                        KeyDef::PageDown => Some(1),
+                        KeyDef::Home => Some(2),
+                        KeyDef::End => Some(3),
+                        _ => None,
                     };
-                    if scrolled {
-                        state.dirty = true;
+                    if let Some(a) = act {
+                        let mut state = self.state.lock().unwrap();
+                        let focused = state.focused_pane();
+                        if let Some(ps) = state.panes.get_mut(&focused) {
+                            match a {
+                                0 => ps.term.scroll_page_up(),
+                                1 => ps.term.scroll_page_down(),
+                                2 => ps.term.scroll_to_top(),
+                                _ => ps.term.scroll_to_bottom(),
+                            }
+                            state.dirty = true;
+                        }
                         return;
                     }
                 }
 
-                // Tab management — Ctrl-only chord
-                if ctrl_only {
-                    match &event.logical_key {
-                        Key::Character(s) if s.as_str() == "t" || s.as_str() == "T" => {
-                            let (w, h) = self.pane_area_size();
-                            let Some(renderer) = self.renderer_ref() else { return };
-                            let mut state = self.state.lock().unwrap();
-                            let new_pane = state.create_new_tab(renderer, w, h);
-                            drop(state);
-                            start_reader(new_pane, &self.state);
+                // Configurable keybindings.
+                if let Some(ref kd) = key_def {
+                    let kb = self.keybindings.clone();
+
+                    if kb.new_tab.matches(mods_bits, kd) {
+                        let (w, h) = self.pane_area_size();
+                        let Some(renderer) = self.renderer_ref() else {
                             return;
-                        }
-                        Key::Named(NamedKey::Tab) => {
+                        };
+                        let new_pane = {
                             let mut state = self.state.lock().unwrap();
-                            state.switch_tab_next();
-                            return;
-                        }
-                        Key::Character(s) => {
-                            // Ctrl+1..9 → switch to tab index (0..8)
-                            if let Some(c) = s.chars().next()
-                                && let Some(d) = c.to_digit(10)
-                                && (1..=9).contains(&d)
-                            {
-                                let mut state = self.state.lock().unwrap();
-                                state.switch_tab_to_index((d - 1) as usize);
-                                return;
-                            }
-                        }
-                        _ => {}
+                            state.create_new_tab(renderer, w, h)
+                        };
+                        start_reader(new_pane, &self.state);
+                        return;
+                    }
+                    if kb.close_tab.matches(mods_bits, kd) {
+                        self.state.lock().unwrap().close_active_tab();
+                        return;
+                    }
+                    if kb.close_pane.matches(mods_bits, kd) {
+                        self.state.lock().unwrap().close_focused_pane();
+                        return;
+                    }
+                    if kb.split_horizontal.matches(mods_bits, kd) {
+                        self.do_split(SplitDirection::Horizontal);
+                        return;
+                    }
+                    if kb.split_vertical.matches(mods_bits, kd) {
+                        self.do_split(SplitDirection::Vertical);
+                        return;
+                    }
+                    if kb.next_tab.matches(mods_bits, kd) {
+                        self.state.lock().unwrap().switch_tab_next();
+                        return;
+                    }
+                    if kb.prev_tab.matches(mods_bits, kd) {
+                        self.state.lock().unwrap().switch_tab_prev();
+                        return;
+                    }
+                    if kb.focus_left.matches(mods_bits, kd) {
+                        self.do_focus(SplitDirection::Horizontal, false);
+                        return;
+                    }
+                    if kb.focus_right.matches(mods_bits, kd) {
+                        self.do_focus(SplitDirection::Horizontal, true);
+                        return;
+                    }
+                    if kb.focus_up.matches(mods_bits, kd) {
+                        self.do_focus(SplitDirection::Vertical, false);
+                        return;
+                    }
+                    if kb.focus_down.matches(mods_bits, kd) {
+                        self.do_focus(SplitDirection::Vertical, true);
+                        return;
+                    }
+
+                    // Ctrl+1..9 — direct tab index, kept out of config.
+                    if mods_bits == ModBits::CTRL
+                        && let KeyDef::Char(c) = kd
+                        && let Some(d) = c.to_digit(10)
+                        && (1..=9).contains(&d)
+                    {
+                        self.state
+                            .lock()
+                            .unwrap()
+                            .switch_tab_to_index((d - 1) as usize);
+                        return;
                     }
                 }
 
-                // Split / close / prev-tab — Ctrl+Shift chord
-                if ctrl_shift {
-                    match &event.logical_key {
-                        Key::Character(s) if s.as_str() == "D" || s.as_str() == "d" => {
-                            let (w, h) = self.pane_area_size();
-                            let Some(renderer) = self.renderer_ref() else { return };
-                            let mut state = self.state.lock().unwrap();
-                            state.split(SplitDirection::Horizontal, renderer, w, h);
-                            let new_ids: Vec<PaneId> = state.tabs.active().tree.pane_ids();
-                            drop(state);
-                            for id in new_ids {
-                                let needs_reader = self
-                                    .state
-                                    .lock()
-                                    .unwrap()
-                                    .panes
-                                    .get(&id)
-                                    .map(|ps| ps.pty.has_reader())
-                                    .unwrap_or(false);
-                                if needs_reader {
-                                    start_reader(id, &self.state);
-                                }
-                            }
-                            return;
-                        }
-                        Key::Character(s) if s.as_str() == "E" || s.as_str() == "e" => {
-                            let (w, h) = self.pane_area_size();
-                            let Some(renderer) = self.renderer_ref() else { return };
-                            let mut state = self.state.lock().unwrap();
-                            state.split(SplitDirection::Vertical, renderer, w, h);
-                            let new_ids: Vec<PaneId> = state.tabs.active().tree.pane_ids();
-                            drop(state);
-                            for id in new_ids {
-                                let needs_reader = self
-                                    .state
-                                    .lock()
-                                    .unwrap()
-                                    .panes
-                                    .get(&id)
-                                    .map(|ps| ps.pty.has_reader())
-                                    .unwrap_or(false);
-                                if needs_reader {
-                                    start_reader(id, &self.state);
-                                }
-                            }
-                            return;
-                        }
-                        Key::Character(s) if s.as_str() == "W" || s.as_str() == "w" => {
-                            let mut state = self.state.lock().unwrap();
-                            state.close_active_tab();
-                            return;
-                        }
-                        Key::Character(s) if s.as_str() == "P" || s.as_str() == "p" => {
-                            let mut state = self.state.lock().unwrap();
-                            state.close_focused_pane();
-                            return;
-                        }
-                        Key::Named(NamedKey::Tab) => {
-                            let mut state = self.state.lock().unwrap();
-                            state.switch_tab_prev();
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Pane focus navigation — Alt+Arrow
-                if alt {
-                    let (w, h) = self.pane_area_size();
-                    let mut state = self.state.lock().unwrap();
-                    let focused = state.focused_pane();
-                    let moved = {
-                        let tab = state.tabs.active();
-                        match &event.logical_key {
-                            Key::Named(NamedKey::ArrowRight) => tab
-                                .tree
-                                .find_adjacent(focused, SplitDirection::Horizontal, true, w, h),
-                            Key::Named(NamedKey::ArrowLeft) => tab
-                                .tree
-                                .find_adjacent(focused, SplitDirection::Horizontal, false, w, h),
-                            Key::Named(NamedKey::ArrowDown) => tab
-                                .tree
-                                .find_adjacent(focused, SplitDirection::Vertical, true, w, h),
-                            Key::Named(NamedKey::ArrowUp) => tab
-                                .tree
-                                .find_adjacent(focused, SplitDirection::Vertical, false, w, h),
-                            _ => None,
-                        }
-                    };
-                    if let Some(new_focus) = moved {
-                        state.tabs.active_mut().focused_pane = new_focus;
-                        state.dirty = true;
-                    }
-                    return;
-                }
-
-                // Normal key input → focused pane in active tab
+                // Plain key input → focused pane in active tab.
                 let bytes: Vec<u8> = match &event.logical_key {
                     Key::Character(s) => s.as_bytes().to_vec(),
                     Key::Named(NamedKey::Enter) => vec![b'\r'],
@@ -600,7 +618,6 @@ impl ApplicationHandler for App {
                 let focused = state.focused_pane();
                 let mut snap_dirty = false;
                 if let Some(ps) = state.panes.get_mut(&focused) {
-                    // Snap viewport back to live content on user input.
                     if ps.term.display_offset() != 0 {
                         ps.term.scroll_to_bottom();
                         snap_dirty = true;
@@ -620,8 +637,6 @@ impl ApplicationHandler for App {
         if needs_redraw && let Some(w) = &self.window {
             w.request_redraw();
         }
-        // Poll dirty flag at ~60Hz so PTY reader thread output reaches the
-        // screen without an EventLoopProxy.  TODO: switch to EventLoopProxy.
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
             std::time::Instant::now() + std::time::Duration::from_millis(16),
         ));
@@ -630,9 +645,21 @@ impl ApplicationHandler for App {
 
 fn main() {
     let config = Config::load();
-    let state = Arc::new(Mutex::new(MuxState::new()));
+    let parsed = match config.keybindings.parse() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "config: keybindings parse error ({e}) — falling back to defaults"
+            );
+            KeyBindingsConfig::default()
+                .parse()
+                .expect("default keybindings always parse")
+        }
+    };
+
+    let state = Arc::new(Mutex::new(MuxState::new(config.shell.clone())));
 
     let event_loop = EventLoop::new().expect("event loop");
-    let mut app = App::new(state, config);
+    let mut app = App::new(state, config, parsed);
     let _ = event_loop.run_app(&mut app);
 }
