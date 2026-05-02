@@ -23,6 +23,7 @@ Windows 환경에서 Claude Code 사용 시 macOS 대비 에이전트 팀 기능
 | [11-implementation-roadmap.md](11-implementation-roadmap.md) | **구현 작업 계획서** | Phase 0~4, Cargo 크레이트 구조, 마일스톤별 작업/검증 |
 | [12-istty-workaround.md](12-istty-workaround.md) | 🔴 **Windows isTTY 우회 — BLOCKED 트랙 (reference 보존)** | spike 결과 in-process fallback, `set_tmux_env` 6+1 env var, `/team` 슬래시 명령 부재, Claude self-report "swap to WSL+tmux" |
 | [13-custompanebackend-track.md](13-custompanebackend-track.md) | **CustomPaneBackend JSON-RPC 트랙 — Phase 2.1 신규** | #26572 7-op, `CLAUDE_PANE_BACKEND_SOCKET`, `zm-socket` 12일 분해, 동기→tokio 2단계, zm-mux 1차 reference 구현 |
+| [14-26572-advocacy-draft.md](14-26572-advocacy-draft.md) | **#26572 댓글 ready-to-post 초안** | 녹화 가이드 (asciinema/OBS), 영문 댓글 본문 (spike 결과 + 우리 reference + 7 사양 ambiguity query), 게시 후 followup |
 
 ---
 
