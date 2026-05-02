@@ -1,0 +1,14 @@
+---
+source: crates/zm-socket/tests/rpc_roundtrip.rs
+assertion_line: 105
+expression: req
+---
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "write",
+  "params": {
+    "context_id": "ctx-2",
+    "data": "aGVsbG8gd29ybGQK"
+  }
+}

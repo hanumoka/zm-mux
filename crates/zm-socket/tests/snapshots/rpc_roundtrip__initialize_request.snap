@@ -1,0 +1,13 @@
+---
+source: crates/zm-socket/tests/rpc_roundtrip.rs
+assertion_line: 29
+expression: req
+---
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "initialize",
+  "params": {
+    "protocol_version": "1.0"
+  }
+}

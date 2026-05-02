@@ -1,0 +1,12 @@
+---
+source: crates/zm-socket/tests/rpc_roundtrip.rs
+assertion_line: 41
+expression: resp
+---
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "self_context_id": "ctx-main"
+  }
+}

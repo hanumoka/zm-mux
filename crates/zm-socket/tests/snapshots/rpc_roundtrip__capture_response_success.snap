@@ -1,0 +1,12 @@
+---
+source: crates/zm-socket/tests/rpc_roundtrip.rs
+assertion_line: 133
+expression: resp
+---
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "data": "line1\nline2\nline3\n"
+  }
+}

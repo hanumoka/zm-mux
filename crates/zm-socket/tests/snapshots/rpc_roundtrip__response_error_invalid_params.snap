@@ -1,0 +1,13 @@
+---
+source: crates/zm-socket/tests/rpc_roundtrip.rs
+assertion_line: 207
+expression: resp
+---
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "error": {
+    "code": -32602,
+    "message": "missing argv"
+  }
+}

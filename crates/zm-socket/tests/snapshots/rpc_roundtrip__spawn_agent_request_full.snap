@@ -1,0 +1,22 @@
+---
+source: crates/zm-socket/tests/rpc_roundtrip.rs
+assertion_line: 61
+expression: req
+---
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "spawn_agent",
+  "params": {
+    "argv": [
+      "claude",
+      "--role",
+      "reviewer"
+    ],
+    "cwd": "/home/user/project",
+    "env": {
+      "ZM_MUX_AGENT_ROLE": "reviewer"
+    },
+    "name": "reviewer-1"
+  }
+}

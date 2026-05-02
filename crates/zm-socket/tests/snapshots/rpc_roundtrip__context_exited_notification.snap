@@ -1,0 +1,13 @@
+---
+source: crates/zm-socket/tests/rpc_roundtrip.rs
+assertion_line: 196
+expression: n
+---
+{
+  "jsonrpc": "2.0",
+  "method": "context_exited",
+  "params": {
+    "context_id": "ctx-2",
+    "exit_code": 0
+  }
+}

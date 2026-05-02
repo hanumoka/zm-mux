@@ -1,0 +1,13 @@
+---
+source: crates/zm-socket/tests/rpc_roundtrip.rs
+assertion_line: 216
+expression: resp
+---
+{
+  "jsonrpc": "2.0",
+  "id": "unknown-id",
+  "error": {
+    "code": -32601,
+    "message": "no such method: foo"
+  }
+}
