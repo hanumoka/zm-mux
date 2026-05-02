@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
-use glyphon::{Cache, Resolution, SwashCache, TextAtlas, TextRenderer, Viewport};
+use cosmic_text::{
+    Attrs, AttrsList, Buffer, Color as CTColor, Family, FontSystem, Metrics, Shaping, Style,
+    Weight, Wrap,
+};
+use glyphon::{Cache, Color, Resolution, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
 use winit::window::Window;
 use zm_core::{ZmError, ZmResult};
 
@@ -10,22 +13,25 @@ use crate::{PaneRenderInfo, Renderer};
 const JETBRAINS_MONO_REGULAR: &[u8] =
     include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
 
-const BG_OUTSIDE_R: f64 = 0x1a as f64 / 255.0;
-const BG_OUTSIDE_G: f64 = 0x1a as f64 / 255.0;
-const BG_OUTSIDE_B: f64 = 0x2e as f64 / 255.0;
+// Window outside-pane background. Stored as 8-bit sRGB; converted to linear
+// for wgpu LoadOp::Clear because our surface format is sRGB.
+const BG_OUTSIDE_SRGB: (u8, u8, u8) = (0x1a, 0x1a, 0x2e);
+
+// Default fg used when a glyph has no explicit color (cosmic-text fallback).
+const DEFAULT_FG_R: u8 = 0xCC;
+const DEFAULT_FG_G: u8 = 0xCC;
+const DEFAULT_FG_B: u8 = 0xCC;
 
 /// GPU-accelerated renderer using wgpu + glyphon.
 ///
-/// Phase 1.3.9-B-1 status: surface init, glyphon allocation, and a clear
-/// pass are wired.  Text/cursor/border draw lands in 1.3.9-B-2.  Until
-/// then this backend produces a blank pane background — opt-in only via
-/// `ZM_RENDER=gpu` so the default user experience is still CpuBackend.
+/// Phase 1.3.9-B-2 status: text drawing via glyphon TextRenderer is wired,
+/// sRGB clear color is gamma-corrected.  Cursor outline + pane borders
+/// land in 1.3.9-B-3 (solid-color rect shader).  Until then the GPU
+/// backend is opt-in via `ZM_RENDER=gpu`; default stays CPU.
 pub struct GpuBackend {
     cell_width: usize,
     cell_height: usize,
-    #[allow(dead_code)]
     font_size: f32,
-    #[allow(dead_code)]
     font_family: String,
 
     surface: wgpu::Surface<'static>,
@@ -34,14 +40,10 @@ pub struct GpuBackend {
     config: wgpu::SurfaceConfiguration,
     size: (u32, u32),
 
-    #[allow(dead_code)]
     font_system: FontSystem,
-    #[allow(dead_code)]
     swash_cache: SwashCache,
     viewport: Viewport,
-    #[allow(dead_code)]
     atlas: TextAtlas,
-    #[allow(dead_code)]
     text_renderer: TextRenderer,
 }
 
@@ -141,6 +143,19 @@ impl GpuBackend {
     }
 }
 
+/// sRGB-encoded value (0..=1) → linear.  IEC 61966-2-1.
+fn srgb_to_linear(c: f64) -> f64 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn srgb_byte_to_linear(b: u8) -> f64 {
+    srgb_to_linear(b as f64 / 255.0)
+}
+
 impl Renderer for GpuBackend {
     fn cell_size(&self) -> (usize, usize) {
         (self.cell_width, self.cell_height)
@@ -156,7 +171,7 @@ impl Renderer for GpuBackend {
         (cols, rows)
     }
 
-    fn render(&mut self, _panes: &[PaneRenderInfo], width: u32, height: u32) -> ZmResult<()> {
+    fn render(&mut self, panes: &[PaneRenderInfo], width: u32, height: u32) -> ZmResult<()> {
         if width == 0 || height == 0 {
             return Ok(());
         }
@@ -168,6 +183,113 @@ impl Renderer for GpuBackend {
         }
         self.viewport
             .update(&self.queue, Resolution { width, height });
+
+        // Build per-pane Buffers with rich text (per-cell fg color / bold /
+        // italic spans).  Buffers must outlive text_renderer.prepare and the
+        // render pass that calls text_renderer.render.
+        let line_height = (self.font_size * 1.4).ceil();
+        let metrics = Metrics::new(self.font_size, line_height);
+        let font_family = self.font_family.clone();
+        let mut pane_buffers: Vec<Buffer> = Vec::with_capacity(panes.len());
+
+        for pane in panes {
+            let term = pane.term;
+            let default_attrs = Attrs::new().family(Family::Name(&font_family));
+
+            // Aggregate cell text into a single string and a parallel
+            // AttrsList that paints each cell's foreground.  Wide-spacers
+            // are skipped because the wide char itself already occupies
+            // both columns from cosmic-text's perspective.
+            let mut text = String::new();
+            let mut byte_spans: Vec<(std::ops::Range<usize>, CTColor, bool, bool)> = Vec::new();
+            let mut byte_pos = 0usize;
+
+            for row in 0..term.rows() {
+                for col in 0..term.cols() {
+                    if term.is_wide_spacer(row, col) {
+                        continue;
+                    }
+                    let cell = term.render_cell(row, col);
+                    let c = if cell.c == '\0' { ' ' } else { cell.c };
+                    let n = c.len_utf8();
+                    text.push(c);
+                    byte_spans.push((
+                        byte_pos..byte_pos + n,
+                        CTColor::rgb(cell.fg.r, cell.fg.g, cell.fg.b),
+                        cell.bold,
+                        cell.italic,
+                    ));
+                    byte_pos += n;
+                }
+                text.push('\n');
+                byte_pos += 1;
+            }
+
+            let mut attrs_list = AttrsList::new(&default_attrs);
+            for (range, color, bold, italic) in &byte_spans {
+                let mut a = Attrs::new().family(Family::Name(&font_family)).color(*color);
+                if *bold {
+                    a = a.weight(Weight::BOLD);
+                }
+                if *italic {
+                    a = a.style(Style::Italic);
+                }
+                attrs_list.add_span(range.clone(), &a);
+            }
+
+            let mut buffer = Buffer::new(&mut self.font_system, metrics);
+            {
+                let mut bw = buffer.borrow_with(&mut self.font_system);
+                bw.set_size(
+                    Some(pane.rect.width as f32),
+                    Some(pane.rect.height as f32),
+                );
+                bw.set_wrap(Wrap::None);
+                bw.lines.clear();
+                for (line_text, line_attrs) in split_lines_with_attrs(&text, &attrs_list) {
+                    bw.lines.push(cosmic_text::BufferLine::new(
+                        line_text,
+                        cosmic_text::LineEnding::None,
+                        line_attrs,
+                        Shaping::Basic,
+                    ));
+                }
+                bw.shape_until_scroll(false);
+            }
+            pane_buffers.push(buffer);
+        }
+
+        // Build TextAreas borrowing the per-pane Buffers above.
+        let text_areas: Vec<TextArea> = pane_buffers
+            .iter()
+            .zip(panes.iter())
+            .map(|(buffer, pane)| TextArea {
+                buffer,
+                left: pane.rect.x as f32,
+                top: pane.rect.y as f32,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: pane.rect.x as i32,
+                    top: pane.rect.y as i32,
+                    right: (pane.rect.x + pane.rect.width) as i32,
+                    bottom: (pane.rect.y + pane.rect.height) as i32,
+                },
+                default_color: Color::rgb(DEFAULT_FG_R, DEFAULT_FG_G, DEFAULT_FG_B),
+                custom_glyphs: &[],
+            })
+            .collect();
+
+        self.text_renderer
+            .prepare(
+                &self.device,
+                &self.queue,
+                &mut self.font_system,
+                &mut self.atlas,
+                &self.viewport,
+                text_areas,
+                &mut self.swash_cache,
+            )
+            .map_err(|e| ZmError::Render(format!("glyphon prepare: {e}")))?;
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -187,17 +309,17 @@ impl Renderer for GpuBackend {
                 label: Some("zm-mux encoder"),
             });
         {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("zm-mux gpu clear"),
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("zm-mux gpu clear+text"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: BG_OUTSIDE_R,
-                            g: BG_OUTSIDE_G,
-                            b: BG_OUTSIDE_B,
+                            r: srgb_byte_to_linear(BG_OUTSIDE_SRGB.0),
+                            g: srgb_byte_to_linear(BG_OUTSIDE_SRGB.1),
+                            b: srgb_byte_to_linear(BG_OUTSIDE_SRGB.2),
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -208,11 +330,56 @@ impl Renderer for GpuBackend {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            // TODO 1.3.9-B-2: text via glyphon TextRenderer.prepare/render
+            self.text_renderer
+                .render(&self.atlas, &self.viewport, &mut pass)
+                .map_err(|e| ZmError::Render(format!("glyphon render: {e}")))?;
             // TODO 1.3.9-B-3: cursor + pane border via solid-color rect shader
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
         Ok(())
     }
+}
+
+/// Split aggregated text + AttrsList into per-line (String, AttrsList) pairs
+/// at '\n' boundaries.  Each output line owns its own AttrsList sliced from
+/// the input.  Used because cosmic_text::Buffer::lines wants one BufferLine
+/// per terminal row; using set_text on the joined string with embedded '\n'
+/// would still create lines but would not let us push into Buffer.lines
+/// directly.
+fn split_lines_with_attrs(
+    text: &str,
+    attrs: &AttrsList,
+) -> Vec<(String, AttrsList)> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for (idx, ch) in text.char_indices() {
+        if ch == '\n' {
+            let end = idx;
+            let line_text = text[start..end].to_string();
+            let line_attrs = slice_attrs(attrs, start, end);
+            out.push((line_text, line_attrs));
+            start = idx + 1;
+        }
+    }
+    if start < text.len() {
+        let line_text = text[start..].to_string();
+        let line_attrs = slice_attrs(attrs, start, text.len());
+        out.push((line_text, line_attrs));
+    }
+    out
+}
+
+fn slice_attrs(src: &AttrsList, start: usize, end: usize) -> AttrsList {
+    let defaults = src.defaults();
+    let mut out = AttrsList::new(&defaults);
+    for (range, attrs_owned) in src.spans_iter() {
+        let s = range.start.max(start);
+        let e = range.end.min(end);
+        if s < e {
+            let attrs = attrs_owned.as_attrs();
+            out.add_span((s - start)..(e - start), &attrs);
+        }
+    }
+    out
 }
