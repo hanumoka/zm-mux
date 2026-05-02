@@ -38,13 +38,12 @@ pub trait Renderer {
 
 /// Try to construct the most capable renderer available, falling back to CPU.
 ///
-/// Env-var semantics (Phase 1.3.10):
+/// Env-var semantics (Phase 1.3.9-B-4):
 ///
 /// | `ZM_RENDER` | Behavior |
 /// |---|---|
-/// | unset / anything else | Default backend (currently CPU; flips to GPU at B-4) |
-/// | `gpu`  | Try GpuBackend; on init failure fall back to CpuBackend |
-/// | `cpu`  | Force CpuBackend even if GPU is available |
+/// | unset / anything other than `cpu` | Default = try GpuBackend, fall back to CpuBackend on init failure |
+/// | `cpu` | Force CpuBackend even if GPU is available |
 ///
 /// Plus `ZM_RENDER_FORCE_INIT_FAIL=1` (test/CI only): when combined with
 /// `ZM_RENDER=gpu`, bypasses the real `GpuBackend::new` call so the
@@ -61,7 +60,7 @@ pub fn create_renderer(
         .unwrap_or_default()
         .to_ascii_lowercase();
     let force_cpu = mode == "cpu";
-    let prefer_gpu = mode == "gpu";
+    let prefer_gpu = !force_cpu;
     let force_init_fail = std::env::var("ZM_RENDER_FORCE_INIT_FAIL").is_ok();
 
     if !force_cpu && prefer_gpu {
