@@ -23,10 +23,9 @@ Bun SFE on Windows → process.stdout.isTTY = undefined
 ```
 
 **psmux의 우회법 확인:**
-- psmux는 ConPTY로 패인 생성 시 `TMUX` 환경변수를 설정
-- Claude Code는 `TMUX` 환경변수를 감지하면 `TmuxBackend`를 사용
-- **핵심**: isTTY 체크보다 TMUX 환경변수 감지가 우선 적용되는 코드 경로가 존재
-- psmux는 추가로 `--teammate-mode tmux`를 자동 주입하는 PowerShell 래퍼 함수 제공
+- psmux는 ConPTY로 패인 생성 시 `TMUX` 환경변수를 설정 (+ TMUX_PANE, CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS, PSMUX_CLAUDE_TEAMMATE_MODE 등 6개)
+- psmux는 `--teammate-mode tmux`를 자동 주입하는 PowerShell `claude` 래퍼 함수 제공
+- **정정 (2026-05-02, [docs/12](./12-istty-workaround.md) 참조)**: 이전 표기 "isTTY 보다 TMUX env 가 우선" 은 **틀림**. issue #26244 OP 가 직접 검증 — psmux 환경에서도 teammates 가 in-process 로 fallback 됨. **진짜 우회 메커니즘은 PowerShell 래퍼의 CLI flag (`--teammate-mode tmux`) 주입**. 환경변수는 tmux CLI 명령(`tmux -V`/`split-window`) 라우팅용 보조 수단.
 
 **이슈 #26244 제안 수정:**
 ```javascript

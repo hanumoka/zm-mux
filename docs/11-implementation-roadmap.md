@@ -128,7 +128,27 @@ zm-mux/
 
 ## Phase 2: AI 에이전트 통합 (10~14주)
 
-### Milestone 2.1: tmux 프로토콜 호환 (Week 19~24)
+> 🔴 **2026-05-02 재배열**: Milestone 2.1 (tmux 호환) 이 사전 spike 에서 BLOCKED 됨 ([`docs/12`](./12-istty-workaround.md) STATUS 섹션 참조). **Milestone 2.1 의 새 내용은 CustomPaneBackend JSON-RPC 7-op** ([`docs/13-custompanebackend-track.md`](./13-custompanebackend-track.md)) — 원래 Milestone 3.3 의 일부였던 작업이 격상. 아래 원래 2.1 (tmux 호환) 섹션은 reference 로 보존하되 **Post-1.0 백로그 강등**.
+
+### Milestone 2.1 (NEW): CustomPaneBackend Minimal Reference (3~4일) + Advocacy (1일)
+
+> 🟡 **Pre-D1 sub-spike 결과 (2026-05-02)**: `claude.exe` 2.1.126 binary 정적 검사에서 `CLAUDE_PANE_BACKEND` / `spawn_agent` / `context_exited` 모두 0건 (vs `TmuxBackend` 28건). Anthropic 미인지 확정 → **옵션 B 채택**: full 12일 reference 대신 **minimal 3~4일 reference + Phase 2.2 self-coordination 병행**.
+
+- **Phase 2.1.A** (3~4일): minimal reference. zm-socket 크레이트의 `rpc::types` + `rpc::handler_min` + `transport_sync` + mock client. 진짜 zm-mux PaneTree 와의 통합 *없이* 프로토콜 자체만 자기완결 검증. 분해는 [`docs/13` Section 4-MIN](./13-custompanebackend-track.md).
+- **Phase 2.1.B** (1일, 외부 액션): github issue #26572 댓글 + Layer 1 evidence + minimal reference 영상 + 1차 reference 자원 표명. 사양 ambiguity query.
+- **Future**: Anthropic 채택 시 [`docs/13` Section 4](./13-custompanebackend-track.md) 의 full 12일로 확장 (PaneTree 통합 + tokio 비동기 + E2E).
+
+### Milestone 2.2 (격상): zm-mux self-coordination (~10일)
+
+> 2026-05-02 재배열로 **즉시 사용자 가치 트랙** 으로 격상. Anthropic 측 #26572 채택 여부와 *독립적으로* multi-agent 좌표화 제공.
+
+원래 docs/11 Phase 2.2 의 5 작업 (Socket API 골격) + 일부 Phase 2.4 (에이전트 감지 + env 주입) 합성. 상세는 아래 "Milestone 2.2: Socket API" 섹션 + Milestone 2.4.
+
+핵심 가치: zm-mux Socket API + MCP 서버 위에서 multi-agent 좌표화. 사용자 시각 — 두 zm-mux 패인에 각자 claude 실행, 둘이 zm-mux 의 task list / 메시지 / 상태 공유. cmux 의 `CMUX_WORKSPACE_ID` 패턴과 동등.
+
+### Milestone 2.1-LEGACY (POST-1.0 BACKLOG): tmux 프로토콜 호환 (Week 19~24)
+
+> 🔴 **BLOCKED**. 아래 분해는 향후 Anthropic 측이 isTTY 게이트를 fix 하거나 `--teammate-mode tmux` flag 가 진짜 코드 경로로 연결되면 unblock. [`docs/12`](./12-istty-workaround.md) 결정 1~5 의 BLOCKED 사유 + reusable 산출물 ([docs/13 Section 7](./13-custompanebackend-track.md)) 참조.
 
 | 작업 | 크레이트 | 설명 | 예상 |
 |------|---------|------|------|
@@ -203,7 +223,7 @@ zm-mux/
 | 작업 | 크레이트 | 설명 | 예상 |
 |------|---------|------|------|
 | 3.3.1 | `zm-socket` | `rmcp` MCP 서버: peer-discover, send-message, get-status, list-agents (4개 도구) | 5일 |
-| 3.3.2 | `zm-socket` | **CustomPaneBackend JSON-RPC**: initialize, spawn_agent, write, capture, kill, list, context_exited — **파라미터 검증, 에러 처리, 이벤트 루프 통합** | 12일 |
+| 3.3.2 | — | ~~CustomPaneBackend JSON-RPC~~ — **2026-05-02 Phase 2.1 으로 격상** ([`docs/13`](./13-custompanebackend-track.md)). 이 슬롯은 향후 사양 v2 후속 또는 multi-backend extension 용으로 비워둠 | — |
 | 3.3.3 | `zm-mux` | 세션 지속성: 레이아웃+스크롤백 직렬화/복원 (serde) | 5일 |
 | 3.3.4 | `zm-app` | 세션 복원 CLI: `zm-mux restore`, `zm-mux sessions` | 2일|
 | 3.3.5 | — | 검증: CustomPaneBackend로 Claude Code 에이전트 팀 동작 (tmux shim 없이) | 5일|

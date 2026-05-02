@@ -21,6 +21,8 @@ Windows 환경에서 Claude Code 사용 시 macOS 대비 에이전트 팀 기능
 | [09-feasibility-analysis.md](09-feasibility-analysis.md) | **기능별 구현 가능성 분석** | TIER 1~4 분류, 로드맵, 크리티컬 리스크, 정직한 결론 |
 | [10-critical-risks-update.md](10-critical-risks-update.md) | **크리티컬 리스크 최신 업데이트** | 3대 리스크 재평가, CustomPaneBackend, COSMIC Terminal, rmcp |
 | [11-implementation-roadmap.md](11-implementation-roadmap.md) | **구현 작업 계획서** | Phase 0~4, Cargo 크레이트 구조, 마일스톤별 작업/검증 |
+| [12-istty-workaround.md](12-istty-workaround.md) | 🔴 **Windows isTTY 우회 — BLOCKED 트랙 (reference 보존)** | spike 결과 in-process fallback, `set_tmux_env` 6+1 env var, `/team` 슬래시 명령 부재, Claude self-report "swap to WSL+tmux" |
+| [13-custompanebackend-track.md](13-custompanebackend-track.md) | **CustomPaneBackend JSON-RPC 트랙 — Phase 2.1 신규** | #26572 7-op, `CLAUDE_PANE_BACKEND_SOCKET`, `zm-socket` 12일 분해, 동기→tokio 2단계, zm-mux 1차 reference 구현 |
 
 ---
 
@@ -34,6 +36,7 @@ Windows 환경에서 Claude Code 사용 시 macOS 대비 에이전트 팀 기능
 6. **Rust가 터미널 개발의 사실상 표준** — Warp, WezTerm, Alacritty, Rio, psmux 모두 Rust
 7. **GPU 렌더링**: Metal(Mac), WebGPU(크로스 플랫폼), OpenGL(레거시) 3가지 선택지
 8. **Claude Code 에이전트 팀**: Windows에서 isTTY 문제로 split-pane 미지원 (이슈 #26244)
+9. **2026-05-02 spike 결과**: psmux 3.3.4 + PS 7.6.1 + Claude Code 2.1.126 환경에서도 agent team 이 in-process 로 fallback (`/team` 슬래시 명령 부재 + Claude 자체가 "WSL+tmux 로 전환" 제안). tmux 호환 트랙(`docs/12`) BLOCKED → CustomPaneBackend (#26572) JSON-RPC 트랙(`docs/13`) 으로 zm-mux Phase 2.1 격상
 
 ---
 
