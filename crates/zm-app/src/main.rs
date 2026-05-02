@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -308,6 +308,10 @@ struct App {
     keybindings: ParsedKeyBindings,
     notifier: NotifyDispatcher,
     notify_gc_counter: u32,
+    /// Active IME composition string for the focused pane.  None when no
+    /// IME composition is in progress.  Rendered as an overlay at the
+    /// cursor position so cell grid stays clean — only Commit touches PTY.
+    ime_preedit: Option<String>,
 }
 
 impl App {
@@ -325,6 +329,22 @@ impl App {
             keybindings,
             notifier: NotifyDispatcher::new(),
             notify_gc_counter: 0,
+            ime_preedit: None,
+        }
+    }
+
+    /// Cancel any in-flight IME composition.  Called whenever focus moves
+    /// (pane or tab change) so a half-typed Korean syllable doesn't leak
+    /// from the source pane to the destination.  The set_ime_allowed
+    /// false→true cycle tells winit to release the current composing
+    /// context to the OS and start a fresh one — winit emits a synthetic
+    /// `Preedit("", None)` along the way which we observe as an empty
+    /// preedit and clear our overlay.
+    fn ime_cancel(&mut self) {
+        self.ime_preedit = None;
+        if let Some(w) = &self.window {
+            w.set_ime_allowed(false);
+            w.set_ime_allowed(true);
         }
     }
 
@@ -351,6 +371,7 @@ impl App {
         let active = state.tabs.active();
         let layouts = active.tree.layout(width as usize, pane_area_h);
         let focused = active.focused_pane;
+        let preedit_str = self.ime_preedit.as_deref();
         let pane_infos: Vec<PaneRenderInfo> = layouts
             .iter()
             .filter_map(|(id, mux_rect)| {
@@ -363,6 +384,7 @@ impl App {
                         height: mux_rect.height,
                     },
                     focused: *id == focused,
+                    ime_preedit: if *id == focused { preedit_str } else { None },
                 })
             })
             .collect();
@@ -438,17 +460,23 @@ impl App {
     }
 
     /// Helper to dedupe focus-direction handlers (Alt+Arrow*).
-    fn do_focus(&self, direction: SplitDirection, forward: bool) {
+    fn do_focus(&mut self, direction: SplitDirection, forward: bool) {
         let (w, h) = self.pane_area_size();
-        let mut state = self.state.lock().unwrap();
-        let focused = state.focused_pane();
-        let moved = {
-            let tab = state.tabs.active();
-            tab.tree.find_adjacent(focused, direction, forward, w, h)
-        };
-        if let Some(new_focus) = moved {
-            state.tabs.active_mut().focused_pane = new_focus;
-            state.dirty = true;
+        let moved;
+        {
+            let mut state = self.state.lock().unwrap();
+            let focused = state.focused_pane();
+            moved = {
+                let tab = state.tabs.active();
+                tab.tree.find_adjacent(focused, direction, forward, w, h)
+            };
+            if let Some(new_focus) = moved {
+                state.tabs.active_mut().focused_pane = new_focus;
+                state.dirty = true;
+            }
+        }
+        if moved.is_some() {
+            self.ime_cancel();
         }
     }
 }
@@ -480,6 +508,10 @@ impl ApplicationHandler for App {
         let (req_w, req_h) = renderer.required_size(INITIAL_COLS as usize, INITIAL_ROWS as usize);
         let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(req_w as u32, req_h as u32));
 
+        // Enable IME early so users can start typing CJK before any focus
+        // event (the very first pane is born focused).
+        window.set_ime_allowed(true);
+
         self.window = Some(window);
         self.renderer = Some(renderer);
 
@@ -498,6 +530,36 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
             }
+            WindowEvent::Ime(ime) => match ime {
+                // Enabled / Disabled are informational; we keep IME always on
+                // when the window has focus and rely on focus-change toggles
+                // to cancel composition.
+                Ime::Enabled | Ime::Disabled => {}
+                Ime::Preedit(text, _cursor) => {
+                    self.ime_preedit = if text.is_empty() { None } else { Some(text) };
+                    self.state.lock().unwrap().dirty = true;
+                }
+                Ime::Commit(text) => {
+                    // winit guarantees a synthetic `Preedit("", None)` just
+                    // before this, so our overlay is already clear.  We only
+                    // need to push the committed bytes to the focused PTY
+                    // exactly once; alacritty parses them as plain text.
+                    self.ime_preedit = None;
+                    let mut state = self.state.lock().unwrap();
+                    let focused = state.focused_pane();
+                    let mut snap_dirty = false;
+                    if let Some(ps) = state.panes.get_mut(&focused) {
+                        if ps.term.display_offset() != 0 {
+                            ps.term.scroll_to_bottom();
+                            snap_dirty = true;
+                        }
+                        let _ = ps.pty.write_input(text.as_bytes());
+                    }
+                    if snap_dirty {
+                        state.dirty = true;
+                    }
+                }
+            },
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y.round() as i32 * 3,
@@ -575,14 +637,17 @@ impl ApplicationHandler for App {
                             state.create_new_tab(renderer, w, h)
                         };
                         start_reader(new_pane, &self.state);
+                        self.ime_cancel();
                         return;
                     }
                     if kb.close_tab.matches(mods_bits, kd) {
                         self.state.lock().unwrap().close_active_tab();
+                        self.ime_cancel();
                         return;
                     }
                     if kb.close_pane.matches(mods_bits, kd) {
                         self.state.lock().unwrap().close_focused_pane();
+                        self.ime_cancel();
                         return;
                     }
                     if kb.split_horizontal.matches(mods_bits, kd) {
@@ -595,10 +660,12 @@ impl ApplicationHandler for App {
                     }
                     if kb.next_tab.matches(mods_bits, kd) {
                         self.state.lock().unwrap().switch_tab_next();
+                        self.ime_cancel();
                         return;
                     }
                     if kb.prev_tab.matches(mods_bits, kd) {
                         self.state.lock().unwrap().switch_tab_prev();
+                        self.ime_cancel();
                         return;
                     }
                     if kb.focus_left.matches(mods_bits, kd) {
@@ -628,6 +695,7 @@ impl ApplicationHandler for App {
                             .lock()
                             .unwrap()
                             .switch_tab_to_index((d - 1) as usize);
+                        self.ime_cancel();
                         return;
                     }
                 }

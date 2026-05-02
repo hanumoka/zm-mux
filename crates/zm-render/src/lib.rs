@@ -27,6 +27,11 @@ pub struct PaneRenderInfo<'a> {
     pub term: &'a ZmTerm,
     pub rect: Rect,
     pub focused: bool,
+    /// Active IME composition string for the focused pane (None for all
+    /// other panes and when no composition is in progress).  Backends
+    /// draw it as an overlay at the cursor position so the cell grid
+    /// stays untouched until the OS commits.
+    pub ime_preedit: Option<&'a str>,
 }
 
 /// One tab's display label.  The renderer draws the title text inside the

@@ -24,6 +24,11 @@ const BG_TAB_INACTIVE: u32 = 0x00_1A1A2E;
 const FG_TAB_R: u8 = 0xE0;
 const FG_TAB_G: u8 = 0xE0;
 const FG_TAB_B: u8 = 0xE0;
+const IME_BG: u32 = 0x00_404060;
+const IME_UNDERLINE: u32 = 0x00_FFFFFF;
+const IME_FG_R: u8 = 0xFF;
+const IME_FG_G: u8 = 0xFF;
+const IME_FG_B: u8 = 0xFF;
 
 // Shaping + rasterization state, separable from presentation surface
 // so the surface borrow in render() does not block draw access to these.
@@ -299,6 +304,82 @@ impl CellShaper {
             BORDER_UNFOCUSED
         };
         draw_pane_border(buf, buf_width, buf_height, r, border);
+
+        if pane.focused
+            && let Some(preedit) = pane.ime_preedit
+            && !preedit.is_empty()
+        {
+            self.draw_ime_overlay(pane, preedit, buf, buf_width, buf_height);
+        }
+    }
+
+    fn draw_ime_overlay(
+        &mut self,
+        pane: &PaneRenderInfo,
+        preedit: &str,
+        buf: &mut [u32],
+        buf_width: usize,
+        buf_height: usize,
+    ) {
+        let term = pane.term;
+        let (crow, ccol) = term.cursor_position();
+        if crow >= term.rows() || ccol >= term.cols() {
+            return;
+        }
+        let r = &pane.rect;
+        let cx = r.x + ccol * self.cell_width;
+        let cy = r.y + crow * self.cell_height;
+
+        // Width estimate from char count.  CJK wide glyphs would warrant 2*
+        // here, but cosmic-text's shaper handles the actual draw bounds; we
+        // only need an approximate background rect.
+        let est_w = preedit.chars().count().max(1) * self.cell_width;
+        fill_rect(buf, buf_width, buf_height, cx, cy, est_w, self.cell_height, IME_BG);
+
+        // Shape + draw the preedit text via the existing CellShaper buffer
+        // (sized for one preedit run at a time).
+        let attrs = Attrs::new().family(Family::Name(&self.font_family));
+        {
+            let mut bw = self.cell_buffer.borrow_with(&mut self.font_system);
+            bw.set_size(Some(est_w as f32), Some(self.cell_height as f32));
+            bw.set_text(preedit, &attrs, Shaping::Basic, None);
+            bw.shape_until_scroll(false);
+        }
+        let fg_color = Color::rgb(IME_FG_R, IME_FG_G, IME_FG_B);
+        let cache = &mut self.swash_cache;
+        let bw = &mut self.cell_buffer.borrow_with(&mut self.font_system);
+        bw.draw(cache, fg_color, |dx, dy, dw, dh, px_color| {
+            let alpha = px_color.a();
+            if alpha == 0 {
+                return;
+            }
+            blend_rect(
+                buf,
+                buf_width,
+                buf_height,
+                cx as i32 + dx,
+                cy as i32 + dy,
+                dw as usize,
+                dh as usize,
+                px_color.r(),
+                px_color.g(),
+                px_color.b(),
+                alpha,
+            );
+        });
+
+        // Bottom underline — visual cue that this is composing, not committed.
+        let underline_y = cy + self.cell_height.saturating_sub(1);
+        fill_rect(
+            buf,
+            buf_width,
+            buf_height,
+            cx,
+            underline_y,
+            est_w,
+            1,
+            IME_UNDERLINE,
+        );
     }
 }
 

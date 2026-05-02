@@ -34,6 +34,11 @@ const TAB_ACTIVE_SRGB: (u8, u8, u8) = (0x2A, 0x48, 0x80);
 const TAB_INACTIVE_SRGB: (u8, u8, u8) = (0x1A, 0x1A, 0x2E);
 const TAB_TEXT_FG: (u8, u8, u8) = (0xE0, 0xE0, 0xE0);
 
+// IME composing overlay palette (sRGB).
+const IME_BG_SRGB: (u8, u8, u8) = (0x40, 0x40, 0x60);
+const IME_UNDERLINE_SRGB: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
+const IME_FG: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
+
 /// GPU-accelerated renderer using wgpu + glyphon.
 pub struct GpuBackend {
     cell_width: usize,
@@ -270,6 +275,42 @@ impl Renderer for GpuBackend {
             pane_buffers.push(buffer);
         }
 
+        // Build per-pane IME preedit Buffer for the focused pane (at most
+        // one).  Lives alongside pane_buffers so its lifetime extends
+        // across prepare() and render().
+        let mut ime_overlay: Option<(Buffer, f32, f32, f32, f32)> = None; // (buf, cx, cy, w, h)
+        for pane in panes {
+            if !pane.focused {
+                continue;
+            }
+            let Some(preedit) = pane.ime_preedit else { continue };
+            if preedit.is_empty() {
+                continue;
+            }
+            let (crow, ccol) = pane.term.cursor_position();
+            if crow >= pane.term.rows() || ccol >= pane.term.cols() {
+                continue;
+            }
+            let cx = pane.rect.x as f32 + (ccol * self.cell_width) as f32;
+            let cy = pane.rect.y as f32 + (crow * self.cell_height) as f32;
+            // Char-count estimate; cosmic-text shapes the real glyph bounds
+            // but we need a background-rect width.
+            let est_w = (preedit.chars().count().max(1) * self.cell_width) as f32;
+            let cell_h = self.cell_height as f32;
+
+            let attrs = Attrs::new().family(Family::Name(&font_family));
+            let mut buffer = Buffer::new(&mut self.font_system, metrics);
+            {
+                let mut bw = buffer.borrow_with(&mut self.font_system);
+                bw.set_size(Some(est_w), Some(cell_h));
+                bw.set_wrap(Wrap::None);
+                bw.set_text(preedit, &attrs, Shaping::Basic, None);
+                bw.shape_until_scroll(false);
+            }
+            ime_overlay = Some((buffer, cx, cy, est_w, cell_h));
+            break; // At most one focused pane has a preedit.
+        }
+
         // Build per-tab title Buffers.  Layout = even split across the bar
         // width, one Buffer per tab cell (text-only; backgrounds are drawn
         // by the rect pipeline below).
@@ -338,6 +379,22 @@ impl Renderer for GpuBackend {
                     bottom: bar_h as i32,
                 },
                 default_color: Color::rgb(TAB_TEXT_FG.0, TAB_TEXT_FG.1, TAB_TEXT_FG.2),
+                custom_glyphs: &[],
+            });
+        }
+        if let Some((buffer, cx, cy, w, h)) = &ime_overlay {
+            text_areas.push(TextArea {
+                buffer,
+                left: *cx,
+                top: *cy,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: *cx as i32,
+                    top: *cy as i32,
+                    right: (*cx + *w) as i32,
+                    bottom: (*cy + *h) as i32,
+                },
+                default_color: Color::rgb(IME_FG.0, IME_FG.1, IME_FG.2),
                 custom_glyphs: &[],
             });
         }
@@ -496,6 +553,34 @@ impl Renderer for GpuBackend {
                     );
                 }
             }
+        }
+
+        // IME composing overlay rect — background + bottom underline.
+        // Drawn after pane borders so it sits on top.  TextArea above
+        // paints the glyphs.
+        if let Some((_buf, cx, cy, w, h)) = &ime_overlay {
+            let bg = srgb_triplet_to_linear(IME_BG_SRGB);
+            let underline = srgb_triplet_to_linear(IME_UNDERLINE_SRGB);
+            push_rect(
+                &mut rect_verts,
+                *cx as i32,
+                *cy as i32,
+                *w as i32,
+                *h as i32,
+                bg,
+                width,
+                height,
+            );
+            push_rect(
+                &mut rect_verts,
+                *cx as i32,
+                (*cy + *h - 1.0) as i32,
+                *w as i32,
+                1,
+                underline,
+                width,
+                height,
+            );
         }
 
         let rect_buffer = if rect_verts.is_empty() {
