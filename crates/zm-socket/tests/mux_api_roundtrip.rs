@@ -31,6 +31,7 @@ impl MuxHandler for FakeMuxHandler {
                     title: "bash".to_string(),
                     agent_type: "unknown".to_string(),
                     agent_status: "unknown".to_string(),
+                    worktree_path: None,
                 },
                 PaneInfo {
                     pane_id: 1,
@@ -41,6 +42,7 @@ impl MuxHandler for FakeMuxHandler {
                     title: "bash".to_string(),
                     agent_type: "unknown".to_string(),
                     agent_status: "unknown".to_string(),
+                    worktree_path: None,
                 },
             ],
         })
@@ -236,7 +238,7 @@ fn mux_server_send_keys_over_socket() {
 #[test]
 fn mux_server_split_pane_over_socket() {
     let (mut client, _h) = connect_to_fake_server("mux-split");
-    let req = mux_req_with(1, MuxMethod::SplitPane, SplitPaneParams { pane_id: 0, direction: "horizontal".into() });
+    let req = mux_req_with(1, MuxMethod::SplitPane, SplitPaneParams { pane_id: 0, direction: "horizontal".into(), cwd: None });
     let (resp, _) = client.call(&req).expect("split_pane");
     match resp {
         Response::Success(s) => {

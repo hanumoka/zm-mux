@@ -94,8 +94,8 @@ mod tests {
         fn handle_list_panes(&self, _p: ListPanesParams) -> Result<ListPanesResult, RpcError> {
             Ok(ListPanesResult {
                 panes: vec![
-                    PaneInfo { pane_id: 0, tab_id: 0, focused: true, cols: 80, rows: 24, title: "pwsh".into(), agent_type: "unknown".into(), agent_status: "unknown".into() },
-                    PaneInfo { pane_id: 1, tab_id: 0, focused: false, cols: 80, rows: 24, title: "pwsh".into(), agent_type: "unknown".into(), agent_status: "unknown".into() },
+                    PaneInfo { pane_id: 0, tab_id: 0, focused: true, cols: 80, rows: 24, title: "pwsh".into(), agent_type: "unknown".into(), agent_status: "unknown".into(), worktree_path: None },
+                    PaneInfo { pane_id: 1, tab_id: 0, focused: false, cols: 80, rows: 24, title: "pwsh".into(), agent_type: "unknown".into(), agent_status: "unknown".into(), worktree_path: None },
                 ],
             })
         }
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn dispatch_split_pane() {
         let handler = MockHandler;
-        let req = mux_req(8, MuxMethod::SplitPane, SplitPaneParams { pane_id: 0, direction: "horizontal".into() });
+        let req = mux_req(8, MuxMethod::SplitPane, SplitPaneParams { pane_id: 0, direction: "horizontal".into(), cwd: None });
         let resp = dispatch_mux(&handler, req);
         let s = unwrap_success(&resp);
         let result: SplitPaneResult = serde_json::from_value(s.result.clone()).unwrap();

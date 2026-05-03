@@ -76,6 +76,8 @@ pub struct PaneInfo {
     pub agent_type: String,
     #[serde(default)]
     pub agent_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
 }
 
 // ---- mux.send_keys ----------------------------------------------------------
@@ -105,6 +107,8 @@ pub struct FocusPaneResult {}
 pub struct SplitPaneParams {
     pub pane_id: u32,
     pub direction: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +226,7 @@ mod tests {
                 title: "powershell".to_string(),
                 agent_type: "unknown".to_string(),
                 agent_status: "unknown".to_string(),
+                worktree_path: None,
             }],
         };
         let json = serde_json::to_value(&result).unwrap();

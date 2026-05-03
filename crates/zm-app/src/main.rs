@@ -41,6 +41,7 @@ struct PaneState {
     term: ZmTerm,
     pty: ZmPtyProcess,
     agent_info: AgentInfo,
+    worktree_path: Option<String>,
 }
 
 struct MuxState {
@@ -80,6 +81,7 @@ impl MuxState {
             default_fg,
             default_bg,
             &env_refs,
+            None,
         );
         panes.insert(initial_pane, pane);
 
@@ -108,7 +110,7 @@ impl MuxState {
         ]
     }
 
-    fn make_pane(&self, cols: u16, rows: u16, pane_id: PaneId) -> PaneState {
+    fn make_pane(&self, cols: u16, rows: u16, pane_id: PaneId, cwd: Option<&str>) -> PaneState {
         let env_vars = Self::pane_env_vars_owned(&self.workspace_id, pane_id, &self.socket_name);
         let env_refs: Vec<(&str, &str)> = env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         make_pane(
@@ -119,6 +121,7 @@ impl MuxState {
             self.default_fg,
             self.default_bg,
             &env_refs,
+            cwd,
         )
     }
 
@@ -152,7 +155,7 @@ impl MuxState {
         let layout = layout.unwrap();
         if let Some((_, rect)) = layout.iter().find(|(id, _)| *id == new_id) {
             let (cols, rows) = renderer.cols_rows_for_size(rect.width, rect.height);
-            let pane = self.make_pane(cols, rows, new_id);
+            let pane = self.make_pane(cols, rows, new_id, None);
             self.panes.insert(new_id, pane);
             self.resize_all_panes(renderer, win_width, win_height);
             self.dirty = true;
@@ -206,7 +209,7 @@ impl MuxState {
     ) -> PaneId {
         let (_tab_id, initial_pane) = self.tabs.create_tab();
         let (cols, rows) = renderer.cols_rows_for_size(win_width, win_height);
-        let pane = self.make_pane(cols, rows, initial_pane);
+        let pane = self.make_pane(cols, rows, initial_pane, None);
         self.panes.insert(initial_pane, pane);
         self.dirty = true;
         initial_pane
@@ -290,6 +293,7 @@ impl MuxState {
         &mut self,
         target: PaneId,
         direction: SplitDirection,
+        cwd: Option<&str>,
     ) -> Option<PaneId> {
         let new_id = self.tabs.alloc_pane_id();
         let tab = self.tabs.tab_containing_pane_mut(target)?;
@@ -301,7 +305,7 @@ impl MuxState {
         let layout = tab.tree.layout(w, h);
         let (_, rect) = layout.iter().find(|(id, _)| *id == new_id)?;
         let (cols, rows) = self.cached_cols_rows(rect.width, rect.height);
-        let pane = self.make_pane(cols, rows, new_id);
+        let pane = self.make_pane(cols, rows, new_id, cwd);
         self.panes.insert(new_id, pane);
         self.resize_all_panes_cached();
         self.dirty = true;
@@ -329,6 +333,12 @@ impl MuxState {
         }
         if let Some(mut ps) = self.panes.remove(&target) {
             ps.pty.kill().ok();
+            if let Some(wt_path) = &ps.worktree_path {
+                let wt = std::path::PathBuf::from(wt_path);
+                if let Some(root) = wt.parent().and_then(|p| p.parent()) {
+                    let _ = zm_agent::worktree::remove_worktree(root, &wt);
+                }
+            }
         }
         self.dirty = true;
         true
@@ -339,7 +349,7 @@ impl MuxState {
         let w = self.pane_area_width;
         let h = self.pane_area_height;
         let (cols, rows) = self.cached_cols_rows(w, h);
-        let pane = self.make_pane(cols, rows, initial_pane);
+        let pane = self.make_pane(cols, rows, initial_pane, None);
         self.panes.insert(initial_pane, pane);
         self.dirty = true;
         (tab_id, initial_pane)
@@ -368,11 +378,12 @@ fn make_pane(
     default_fg: CellColor,
     default_bg: CellColor,
     env_vars: &[(&str, &str)],
+    cwd: Option<&str>,
 ) -> PaneState {
-    let pty = zm_pty::spawn_pty(rows, cols, shell_cfg, env_vars).expect("PTY spawn");
+    let pty = zm_pty::spawn_pty(rows, cols, shell_cfg, env_vars, cwd).expect("PTY spawn");
     let term = ZmTerm::new(cols, rows, scrollback_lines, default_fg, default_bg)
         .expect("term init");
-    PaneState { term, pty, agent_info: AgentInfo::default() }
+    PaneState { term, pty, agent_info: AgentInfo::default(), worktree_path: cwd.map(String::from) }
 }
 
 fn start_reader(pane_id: PaneId, state: &Arc<Mutex<MuxState>>) {
@@ -447,6 +458,7 @@ impl MuxHandler for AppMuxHandler {
                     title: tab.title.clone().unwrap_or_default(),
                     agent_type: at.to_string(),
                     agent_status: as_.to_string(),
+                    worktree_path: ps.and_then(|p| p.worktree_path.clone()),
                 });
             }
         }
@@ -509,7 +521,7 @@ impl MuxHandler for AppMuxHandler {
         let new_id = {
             let mut state = self.state.lock().expect("MuxState lock");
             state
-                .split_pane_by_id(PaneId(params.pane_id), direction)
+                .split_pane_by_id(PaneId(params.pane_id), direction, params.cwd.as_deref())
                 .ok_or_else(|| RpcError::new(SPLIT_FAILED, "split failed"))?
         };
         start_reader(new_id, &self.state);
@@ -1821,7 +1833,7 @@ fn cli_main(args: &[String]) {
                 jsonrpc: JSONRPC_VERSION.to_string(),
                 id: RequestId::Num(1),
                 method: MuxMethod::SplitPane.as_str().to_string(),
-                params: serde_json::to_value(SplitPaneParams { pane_id, direction }).unwrap(),
+                params: serde_json::to_value(SplitPaneParams { pane_id, direction, cwd: None }).unwrap(),
             };
             match client.call(&req) {
                 Ok((Response::Success(s), _)) => {
@@ -1930,6 +1942,149 @@ fn cli_main(args: &[String]) {
                 Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
             }
         }
+        "launch" => {
+            if args.len() < 3 {
+                eprintln!("usage: zm-mux launch <agent1> [agent2] ...");
+                eprintln!("  agents: claude, codex, gemini");
+                eprintln!("  example: zm-mux launch claude codex");
+                std::process::exit(1);
+            }
+            let agent_names: Vec<&str> = args[2..].iter().map(|s| s.as_str()).collect();
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let git_root = zm_agent::worktree::detect_git_root(&cwd).ok();
+
+            let mut launched = Vec::new();
+            let mut last_pane: Option<u32> = None;
+
+            for agent_name in &agent_names {
+                let worktree = if let Some(ref root) = git_root {
+                    match zm_agent::worktree::create_worktree(root, agent_name) {
+                        Ok(wt) => Some(wt),
+                        Err(e) => {
+                            eprintln!("warning: worktree creation failed for {agent_name}: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let target_pane = last_pane.unwrap_or(0);
+                let cwd_str = worktree.as_ref().map(|wt| wt.path.to_string_lossy().to_string());
+                let split_req = Request {
+                    jsonrpc: JSONRPC_VERSION.to_string(),
+                    id: RequestId::Num(1),
+                    method: MuxMethod::SplitPane.as_str().to_string(),
+                    params: serde_json::to_value(SplitPaneParams {
+                        pane_id: target_pane,
+                        direction: "horizontal".into(),
+                        cwd: cwd_str.clone(),
+                    }).unwrap(),
+                };
+
+                let new_pane_id = match client.call(&split_req) {
+                    Ok((Response::Success(s), _)) => {
+                        let r: SplitPaneResult = serde_json::from_value(s.result).expect("parse");
+                        r.new_pane_id
+                    }
+                    Ok((Response::Error(e), _)) => {
+                        eprintln!("error splitting for {agent_name}: {}", e.error.message);
+                        break;
+                    }
+                    Err(e) => { eprintln!("error: {e}"); break; }
+                };
+
+                let info_req = Request {
+                    jsonrpc: JSONRPC_VERSION.to_string(),
+                    id: RequestId::Num(1),
+                    method: MuxMethod::SetAgentInfo.as_str().to_string(),
+                    params: serde_json::to_value(SetAgentInfoParams {
+                        pane_id: new_pane_id,
+                        agent_type: Some(agent_name.to_string()),
+                        agent_status: Some("waiting".into()),
+                    }).unwrap(),
+                };
+                let _ = client.call(&info_req);
+
+                let cmd = format!("{agent_name}\r\n");
+                let send_req = Request {
+                    jsonrpc: JSONRPC_VERSION.to_string(),
+                    id: RequestId::Num(1),
+                    method: MuxMethod::SendKeys.as_str().to_string(),
+                    params: serde_json::to_value(SendKeysParams {
+                        pane_id: new_pane_id,
+                        data: cmd,
+                    }).unwrap(),
+                };
+                let _ = client.call(&send_req);
+
+                launched.push((new_pane_id, *agent_name, cwd_str));
+                last_pane = Some(new_pane_id);
+            }
+
+            println!("{:<8} {:<10} WORKTREE", "PANE_ID", "AGENT");
+            for (pid, name, wt) in &launched {
+                println!("{:<8} {:<10} {}", pid, name, wt.as_deref().unwrap_or("-"));
+            }
+        }
+        "worktree" => {
+            if args.len() < 3 {
+                eprintln!("usage: zm-mux worktree <list|cleanup>");
+                std::process::exit(1);
+            }
+            match args[2].as_str() {
+                "list" => {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    match zm_agent::worktree::detect_git_root(&cwd) {
+                        Ok(root) => {
+                            let wt_dir = root.join(".zm-worktrees");
+                            if wt_dir.exists() {
+                                for entry in std::fs::read_dir(&wt_dir).unwrap() {
+                                    if let Ok(e) = entry {
+                                        if e.path().is_dir() {
+                                            println!("{}", e.path().display());
+                                        }
+                                    }
+                                }
+                            } else {
+                                println!("no worktrees found");
+                            }
+                        }
+                        Err(_) => eprintln!("not a git repository"),
+                    }
+                }
+                "cleanup" => {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    match zm_agent::worktree::detect_git_root(&cwd) {
+                        Ok(root) => {
+                            let wt_dir = root.join(".zm-worktrees");
+                            if wt_dir.exists() {
+                                let mut removed = 0;
+                                for entry in std::fs::read_dir(&wt_dir).unwrap() {
+                                    if let Ok(e) = entry {
+                                        if e.path().is_dir() {
+                                            match zm_agent::worktree::remove_worktree(&root, &e.path()) {
+                                                Ok(()) => { removed += 1; }
+                                                Err(err) => eprintln!("warning: {}: {err}", e.path().display()),
+                                            }
+                                        }
+                                    }
+                                }
+                                println!("removed {removed} worktree(s)");
+                            } else {
+                                println!("no worktrees to clean");
+                            }
+                        }
+                        Err(_) => eprintln!("not a git repository"),
+                    }
+                }
+                other => {
+                    eprintln!("unknown worktree subcommand: {other}");
+                    eprintln!("usage: zm-mux worktree <list|cleanup>");
+                    std::process::exit(1);
+                }
+            }
+        }
         "--version" | "-V" => {
             println!("zm-mux {}", env!("CARGO_PKG_VERSION"));
         }
@@ -1946,7 +2101,9 @@ fn cli_main(args: &[String]) {
             println!("  zm-mux close-pane <pane_id>            Close pane");
             println!("  zm-mux new-tab                         Create tab");
             println!("  zm-mux close-tab <tab_id>              Close tab");
-            println!("  zm-mux agent-info <pane_id> [type] [status]  Set agent info");
+            println!("  zm-mux agent-info <id> [type] [status] Set agent info");
+            println!("  zm-mux launch <agent1> [agent2] ...    Launch agents with worktrees");
+            println!("  zm-mux worktree list|cleanup            Manage worktrees");
             println!("  zm-mux --version                       Show version");
         }
         other => {

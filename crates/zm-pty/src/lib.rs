@@ -19,6 +19,7 @@ pub fn spawn_pty(
     cols: u16,
     shell: &ShellConfig,
     env_vars: &[(&str, &str)],
+    cwd: Option<&str>,
 ) -> ZmResult<ZmPtyProcess> {
     let mut cmd = if shell.program.is_empty() {
         #[cfg(windows)]
@@ -41,6 +42,9 @@ pub fn spawn_pty(
     };
     for &(k, v) in env_vars {
         cmd.env(k, v);
+    }
+    if let Some(dir) = cwd {
+        cmd.cwd(dir);
     }
 
     let pty_system = native_pty_system();
@@ -78,7 +82,7 @@ pub fn spawn_pty(
 }
 
 pub fn spawn_default_shell(rows: u16, cols: u16) -> ZmResult<ZmPtyProcess> {
-    spawn_pty(rows, cols, &ShellConfig::default(), &[])
+    spawn_pty(rows, cols, &ShellConfig::default(), &[], None)
 }
 
 impl ZmPtyProcess {
@@ -142,7 +146,7 @@ mod tests {
     #[test]
     fn pty_spawn_and_read() {
         let shell = test_shell();
-        let mut proc = spawn_pty(24, 80, &shell, &[]).expect("spawn should succeed");
+        let mut proc = spawn_pty(24, 80, &shell, &[], None).expect("spawn should succeed");
         let reader = proc.take_reader().expect("reader");
 
         let (tx, rx) = mpsc::channel();
@@ -173,7 +177,7 @@ mod tests {
     #[test]
     fn pty_write_does_not_error() {
         let shell = test_shell();
-        let mut proc = spawn_pty(24, 80, &shell, &[]).expect("spawn");
+        let mut proc = spawn_pty(24, 80, &shell, &[], None).expect("spawn");
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         let result = proc.write_input(b"echo test\r\n");
@@ -185,7 +189,7 @@ mod tests {
     #[test]
     fn pty_kill() {
         let shell = test_shell();
-        let mut proc = spawn_pty(24, 80, &shell, &[]).expect("spawn");
+        let mut proc = spawn_pty(24, 80, &shell, &[], None).expect("spawn");
         assert!(
             proc.try_wait().unwrap().is_none(),
             "process should be running"
