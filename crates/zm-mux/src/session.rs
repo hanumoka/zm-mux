@@ -151,6 +151,7 @@ mod tests {
         let restored = loaded.to_tab_set();
         assert_eq!(restored.active().tree.pane_count(), 2);
         assert_eq!(restored.next_pane_id(), tabs.next_pane_id());
+        assert_eq!(restored.active().tree.pane_ids(), tabs.active().tree.pane_ids());
     }
 
     #[test]

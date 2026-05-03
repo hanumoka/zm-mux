@@ -42,6 +42,7 @@ struct PaneState {
     pty: ZmPtyProcess,
     agent_info: AgentInfo,
     worktree_path: Option<String>,
+    git_root: Option<String>,
 }
 
 struct MuxState {
@@ -182,8 +183,8 @@ impl MuxState {
             tab.focused_pane = next_focus;
             to_remove = focused;
         }
-        if let Some(mut ps) = self.panes.remove(&to_remove) {
-            ps.pty.kill().ok();
+        if let Some(ps) = self.panes.remove(&to_remove) {
+            Self::cleanup_pane(ps);
         }
         self.dirty = true;
     }
@@ -194,8 +195,8 @@ impl MuxState {
             return;
         }
         for id in removed {
-            if let Some(mut ps) = self.panes.remove(&id) {
-                ps.pty.kill().ok();
+            if let Some(ps) = self.panes.remove(&id) {
+                Self::cleanup_pane(ps);
             }
         }
         self.dirty = true;
@@ -331,17 +332,21 @@ impl MuxState {
         if !tab.tree.remove(target) {
             return false;
         }
-        if let Some(mut ps) = self.panes.remove(&target) {
-            ps.pty.kill().ok();
-            if let Some(wt_path) = &ps.worktree_path {
-                let wt = std::path::PathBuf::from(wt_path);
-                if let Some(root) = wt.parent().and_then(|p| p.parent()) {
-                    let _ = zm_agent::worktree::remove_worktree(root, &wt);
-                }
-            }
+        if let Some(ps) = self.panes.remove(&target) {
+            Self::cleanup_pane(ps);
         }
         self.dirty = true;
         true
+    }
+
+    fn cleanup_pane(mut ps: PaneState) {
+        ps.pty.kill().ok();
+        if let (Some(wt_path), Some(root)) = (&ps.worktree_path, &ps.git_root) {
+            let _ = zm_agent::worktree::remove_worktree(
+                std::path::Path::new(root),
+                std::path::Path::new(wt_path),
+            );
+        }
     }
 
     fn create_tab_cached(&mut self) -> (zm_mux::TabId, PaneId) {
@@ -361,8 +366,8 @@ impl MuxState {
             return false;
         }
         for id in removed {
-            if let Some(mut ps) = self.panes.remove(&id) {
-                ps.pty.kill().ok();
+            if let Some(ps) = self.panes.remove(&id) {
+                Self::cleanup_pane(ps);
             }
         }
         self.dirty = true;
@@ -383,7 +388,12 @@ fn make_pane(
     let pty = zm_pty::spawn_pty(rows, cols, shell_cfg, env_vars, cwd).expect("PTY spawn");
     let term = ZmTerm::new(cols, rows, scrollback_lines, default_fg, default_bg)
         .expect("term init");
-    PaneState { term, pty, agent_info: AgentInfo::default(), worktree_path: cwd.map(String::from) }
+    let git_root = cwd.and_then(|dir| {
+        zm_agent::worktree::detect_git_root(std::path::Path::new(dir))
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+    });
+    PaneState { term, pty, agent_info: AgentInfo::default(), worktree_path: cwd.map(String::from), git_root }
 }
 
 fn start_reader(pane_id: PaneId, state: &Arc<Mutex<MuxState>>) {
