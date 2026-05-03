@@ -4,6 +4,14 @@
       "type": "stdio",
       "command": "cmd",
       "args": ["/c", "npx", "@playwright/mcp@latest", "--vision"]
+    },
+    "zm-mux": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["run", "-p", "zm-mux-mcp", "--release"],
+      "env": {
+        "ZM_MUX_SOCKET_PATH": ""
+      }
     }
   }
 }

@@ -9,6 +9,7 @@ members = [
     "crates/zm-agent",
     "crates/zm-socket",
     "crates/zm-app",
+    "crates/zm-mux-mcp",
 ]
 
 [workspace.package]
@@ -44,3 +45,6 @@ thiserror = "2"
 regex = "1"
 interprocess = "2"
 arboard = "3"
+rmcp = { version = "0.16", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+anyhow = "1"
