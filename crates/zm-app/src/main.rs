@@ -1,6 +1,5 @@
 mod notify;
 
-use portable_pty::CommandBuilder;
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
@@ -19,7 +18,7 @@ use zm_render::{
     HighlightCell, PaneRenderInfo, Rect, Renderer, TAB_BAR_HEIGHT_PX, TabBarInfo, TabLabel,
     create_renderer,
 };
-use zm_term::{OscEvent, ZmTerm};
+use zm_term::{CellColor, OscEvent, ZmTerm};
 
 use crate::notify::NotifyDispatcher;
 
@@ -36,13 +35,28 @@ struct MuxState {
     panes: HashMap<PaneId, PaneState>,
     dirty: bool,
     shell_cfg: ShellConfig,
+    scrollback_lines: usize,
+    default_fg: CellColor,
+    default_bg: CellColor,
 }
 
 impl MuxState {
-    fn new(shell_cfg: ShellConfig) -> Self {
+    fn new(
+        shell_cfg: ShellConfig,
+        scrollback_lines: usize,
+        default_fg: CellColor,
+        default_bg: CellColor,
+    ) -> Self {
         let (tabs, initial_pane) = TabSet::new();
-        let pane = create_pane(INITIAL_COLS, INITIAL_ROWS, &shell_cfg);
         let mut panes = HashMap::new();
+        let pane = make_pane(
+            INITIAL_COLS,
+            INITIAL_ROWS,
+            &shell_cfg,
+            scrollback_lines,
+            default_fg,
+            default_bg,
+        );
         panes.insert(initial_pane, pane);
 
         Self {
@@ -50,7 +64,21 @@ impl MuxState {
             panes,
             dirty: true,
             shell_cfg,
+            scrollback_lines,
+            default_fg,
+            default_bg,
         }
+    }
+
+    fn make_pane(&self, cols: u16, rows: u16) -> PaneState {
+        make_pane(
+            cols,
+            rows,
+            &self.shell_cfg,
+            self.scrollback_lines,
+            self.default_fg,
+            self.default_bg,
+        )
     }
 
     fn focused_pane(&self) -> PaneId {
@@ -83,7 +111,7 @@ impl MuxState {
         let layout = layout.unwrap();
         if let Some((_, rect)) = layout.iter().find(|(id, _)| *id == new_id) {
             let (cols, rows) = renderer.cols_rows_for_size(rect.width, rect.height);
-            let pane = create_pane(cols, rows, &self.shell_cfg);
+            let pane = self.make_pane(cols, rows);
             self.panes.insert(new_id, pane);
             self.resize_all_panes(renderer, win_width, win_height);
             self.dirty = true;
@@ -137,7 +165,7 @@ impl MuxState {
     ) -> PaneId {
         let (_tab_id, initial_pane) = self.tabs.create_tab();
         let (cols, rows) = renderer.cols_rows_for_size(win_width, win_height);
-        let pane = create_pane(cols, rows, &self.shell_cfg);
+        let pane = self.make_pane(cols, rows);
         self.panes.insert(initial_pane, pane);
         self.dirty = true;
         initial_pane
@@ -180,18 +208,17 @@ impl MuxState {
     }
 }
 
-fn create_pane(cols: u16, rows: u16, shell_cfg: &ShellConfig) -> PaneState {
-    let cmd = if shell_cfg.program.is_empty() {
-        CommandBuilder::new_default_prog()
-    } else {
-        let mut c = CommandBuilder::new(&shell_cfg.program);
-        for arg in &shell_cfg.args {
-            c.arg(arg);
-        }
-        c
-    };
-    let pty = zm_pty::spawn_pty(rows, cols, cmd).expect("PTY spawn");
-    let term = ZmTerm::new(cols, rows).expect("term init");
+fn make_pane(
+    cols: u16,
+    rows: u16,
+    shell_cfg: &ShellConfig,
+    scrollback_lines: usize,
+    default_fg: CellColor,
+    default_bg: CellColor,
+) -> PaneState {
+    let pty = zm_pty::spawn_pty(rows, cols, shell_cfg).expect("PTY spawn");
+    let term = ZmTerm::new(cols, rows, scrollback_lines, default_fg, default_bg)
+        .expect("term init");
     PaneState { term, pty }
 }
 
@@ -553,6 +580,7 @@ impl ApplicationHandler for App {
             window.clone(),
             self.config.font.size,
             &self.config.font.family,
+            &self.config.colors,
         )
         .expect("renderer init");
 
@@ -766,6 +794,9 @@ impl ApplicationHandler for App {
                         return;
                     }
                     if kb.search.matches(mods_bits, kd) {
+                        // Cancel any in-flight IME composition so a half-typed
+                        // syllable doesn't bleed into the search query overlay.
+                        self.ime_cancel();
                         self.search.active = true;
                         self.search.query.clear();
                         self.search.matches.clear();
@@ -881,7 +912,17 @@ fn main() {
         }
     };
 
-    let state = Arc::new(Mutex::new(MuxState::new(config.shell.clone())));
+    let (fr, fg, fb) = config.colors.foreground_rgb();
+    let (br, bg, bb) = config.colors.background_rgb();
+    let default_fg = CellColor::new(fr, fg, fb);
+    let default_bg = CellColor::new(br, bg, bb);
+
+    let state = Arc::new(Mutex::new(MuxState::new(
+        config.shell.clone(),
+        config.scrollback.max_lines,
+        default_fg,
+        default_bg,
+    )));
 
     let event_loop = EventLoop::new().expect("event loop");
     let mut app = App::new(state, config, parsed);

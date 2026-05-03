@@ -6,14 +6,13 @@ use cosmic_text::{
 };
 use softbuffer::{Context, Surface};
 use winit::window::Window;
-use zm_core::{ZmError, ZmResult};
+use zm_core::{ColorsConfig, ZmError, ZmResult};
 
 use crate::{HighlightCell, PaneRenderInfo, Rect, Renderer, TAB_BAR_HEIGHT_PX, TabBarInfo};
 
 const JETBRAINS_MONO_REGULAR: &[u8] =
     include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
 
-const BG_OUTSIDE: u32 = 0x00_1a1a2e;
 const BG_PANE: u32 = 0x00_000000;
 const CURSOR_COLOR: u32 = 0x00_CCCCCC;
 const BORDER_FOCUSED: u32 = 0x00_4488FF;
@@ -85,6 +84,7 @@ impl CellShaper {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_panes(
         &mut self,
         tab_bar: &TabBarInfo,
@@ -92,9 +92,10 @@ impl CellShaper {
         buf: &mut [u32],
         width: usize,
         height: usize,
+        bg_outside: u32,
     ) {
         for pixel in buf.iter_mut() {
-            *pixel = BG_OUTSIDE;
+            *pixel = bg_outside;
         }
         self.draw_tab_bar(tab_bar, buf, width, height);
         for pane in panes {
@@ -416,6 +417,7 @@ pub struct CpuBackend {
     shaper: CellShaper,
     _context: Context<Arc<Window>>,
     surface: Surface<Arc<Window>, Arc<Window>>,
+    bg_outside: u32,
 }
 
 impl CpuBackend {
@@ -423,6 +425,7 @@ impl CpuBackend {
         window: Arc<Window>,
         font_size: f32,
         font_family: impl Into<String>,
+        colors: &ColorsConfig,
     ) -> ZmResult<Self> {
         let shaper = CellShaper::new(font_size, font_family.into())?;
 
@@ -431,10 +434,14 @@ impl CpuBackend {
         let surface = Surface::new(&context, window)
             .map_err(|e| ZmError::Render(format!("softbuffer surface: {e}")))?;
 
+        let (br, bg, bb) = colors.background_rgb();
+        let bg_outside = ((br as u32) << 16) | ((bg as u32) << 8) | (bb as u32);
+
         Ok(Self {
             shaper,
             _context: context,
             surface,
+            bg_outside,
         })
     }
 }
@@ -465,8 +472,14 @@ impl Renderer for CpuBackend {
             .map_err(|e| ZmError::Render(format!("surface buffer_mut: {e}")))?;
 
         let buf_slice: &mut [u32] = &mut buffer;
-        self.shaper
-            .draw_panes(tab_bar, panes, buf_slice, width as usize, height as usize);
+        self.shaper.draw_panes(
+            tab_bar,
+            panes,
+            buf_slice,
+            width as usize,
+            height as usize,
+            self.bg_outside,
+        );
 
         buffer
             .present()

@@ -130,6 +130,10 @@ All research is in `docs/`. These are in Korean.
 | `08-multi-agent-collaboration.md` | Multi-agent collaboration ecosystem (4 patterns) |
 | `09-feasibility-analysis.md` | Feature feasibility analysis (TIER 1-4), roadmap |
 | `10-critical-risks-update.md` | Critical risk reassessment, COSMIC Terminal, CustomPaneBackend |
+| `11-implementation-roadmap.md` | Phase 0-4 work plan, Cargo crate layout, milestone-by-milestone tasks |
+| `12-istty-workaround.md` | 🔴 Windows isTTY workaround (BLOCKED track, kept for reference) — psmux env vars, `/team` slash absent |
+| `13-custompanebackend-track.md` | CustomPaneBackend JSON-RPC track (Phase 2.1+), #26572 7-op breakdown, sync→tokio staging |
+| `14-26572-advocacy-draft.md` | Ready-to-post #26572 comment + recording guide for the minimal reference demo |
 
 ## Language
 

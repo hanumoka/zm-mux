@@ -6,6 +6,6 @@ license.workspace = true
 description = "Shared types, errors, and traits for zm-mux"
 
 [dependencies]
-thiserror = "2"
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+thiserror = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }

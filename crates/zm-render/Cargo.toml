@@ -6,11 +6,11 @@ license.workspace = true
 description = "GPU/CPU rendering for zm-mux (glyphon + wgpu + softbuffer)"
 
 [dependencies]
-zm-core = { path = "../zm-core" }
-zm-term = { path = "../zm-term" }
-softbuffer = "0.4"
-cosmic-text = "0.18"
-winit = "0.30"
-wgpu = "29"
-glyphon = "0.11"
-pollster = "0.4"
+zm-core = { workspace = true }
+zm-term = { workspace = true }
+softbuffer = { workspace = true }
+cosmic-text = { workspace = true }
+winit = { workspace = true }
+wgpu = { workspace = true }
+glyphon = { workspace = true }
+pollster = { workspace = true }

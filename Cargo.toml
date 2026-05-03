@@ -16,3 +16,30 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/hanumoka/zm-mux"
+
+[workspace.dependencies]
+# Internal crates
+zm-core = { path = "crates/zm-core" }
+zm-pty = { path = "crates/zm-pty" }
+zm-term = { path = "crates/zm-term" }
+zm-render = { path = "crates/zm-render" }
+zm-mux = { path = "crates/zm-mux" }
+zm-agent = { path = "crates/zm-agent" }
+zm-socket = { path = "crates/zm-socket" }
+
+# External — pinned in one place so the GUI/PTY/render stack stays in lockstep
+winit = "0.30"
+portable-pty = "0.9"
+alacritty_terminal = "0.26"
+vte = "0.15"
+softbuffer = "0.4"
+cosmic-text = "0.18"
+wgpu = "29"
+glyphon = "0.11"
+pollster = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+regex = "1"
+interprocess = "2"

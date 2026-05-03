@@ -113,6 +113,28 @@ impl Default for ColorsConfig {
     }
 }
 
+impl ColorsConfig {
+    pub fn background_rgb(&self) -> (u8, u8, u8) {
+        parse_hex_color(&self.background).unwrap_or((0x1a, 0x1a, 0x2e))
+    }
+
+    pub fn foreground_rgb(&self) -> (u8, u8, u8) {
+        parse_hex_color(&self.foreground).unwrap_or((0xe0, 0xe0, 0xe0))
+    }
+}
+
+fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
+    let s = s.trim();
+    let s = s.strip_prefix('#').unwrap_or(s);
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some((r, g, b))
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShellConfig {
@@ -226,6 +248,28 @@ mod tests {
         let err = cfg.parse().unwrap_err();
         assert!(err.contains("new_tab"));
         assert!(err.contains("NotAKey"));
+    }
+
+    #[test]
+    fn colors_hex_round_trip() {
+        let cfg = ColorsConfig::default();
+        assert_eq!(cfg.background_rgb(), (0x1a, 0x1a, 0x2e));
+        assert_eq!(cfg.foreground_rgb(), (0xe0, 0xe0, 0xe0));
+
+        let custom = ColorsConfig {
+            background: "#102030".to_string(),
+            foreground: "abcdef".to_string(),
+        };
+        assert_eq!(custom.background_rgb(), (0x10, 0x20, 0x30));
+        assert_eq!(custom.foreground_rgb(), (0xab, 0xcd, 0xef));
+
+        // Malformed → defaults.
+        let bad = ColorsConfig {
+            background: "nope".to_string(),
+            foreground: "#12".to_string(),
+        };
+        assert_eq!(bad.background_rgb(), (0x1a, 0x1a, 0x2e));
+        assert_eq!(bad.foreground_rgb(), (0xe0, 0xe0, 0xe0));
     }
 
     #[test]

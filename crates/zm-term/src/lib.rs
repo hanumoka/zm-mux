@@ -198,12 +198,23 @@ pub struct ZmTerm {
     osc_dispatcher: OscDispatcher,
     events: Arc<Mutex<Vec<Event>>>,
     osc_events: Arc<Mutex<Vec<OscEvent>>>,
+    default_fg: CellColor,
+    default_bg: CellColor,
 }
 
 impl ZmTerm {
-    pub fn new(cols: u16, rows: u16) -> ZmResult<Self> {
+    pub fn new(
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+        default_fg: CellColor,
+        default_bg: CellColor,
+    ) -> ZmResult<Self> {
         let size = TermSize { cols, rows };
-        let config = TermConfig::default();
+        let config = TermConfig {
+            scrolling_history: scrollback_lines,
+            ..TermConfig::default()
+        };
         let event_collector = EventCollector::new();
         let events = event_collector.shared();
         let term = Term::new(config, &size, event_collector);
@@ -219,6 +230,8 @@ impl ZmTerm {
             osc_dispatcher,
             events,
             osc_events,
+            default_fg,
+            default_bg,
         })
     }
 
@@ -287,14 +300,19 @@ impl ZmTerm {
 
         let cell = &grid[line][column];
 
+        use alacritty_terminal::vte::ansi::NamedColor;
         let fg = match cell.fg {
             Color::Spec(rgb) => CellColor::new(rgb.r, rgb.g, rgb.b),
+            Color::Named(NamedColor::Foreground) => self.default_fg,
+            Color::Named(NamedColor::Background) => self.default_bg,
             Color::Named(name) => named_color_to_rgb(name),
             Color::Indexed(idx) => indexed_color_to_rgb(idx),
         };
 
         let bg = match cell.bg {
             Color::Spec(rgb) => CellColor::new(rgb.r, rgb.g, rgb.b),
+            Color::Named(NamedColor::Foreground) => self.default_fg,
+            Color::Named(NamedColor::Background) => self.default_bg,
             Color::Named(name) => named_color_to_rgb(name),
             Color::Indexed(idx) => indexed_color_to_rgb(idx),
         };
@@ -333,8 +351,9 @@ impl ZmTerm {
 
     /// Search the visible viewport for a regex pattern.  Returns one match
     /// per occurrence with viewport-relative `(row, col, len)` in *cell
-    /// units* (chars, not bytes — wide CJK glyphs count as 1 cell here;
-    /// the renderer is the layer that knows pixel widths).
+    /// units* — wide CJK glyphs count as 2 cells (matching how the grid
+    /// itself stores them, so renderers can paint highlight rects without
+    /// a width recompute).
     ///
     /// Empty pattern returns no matches.  Invalid regex returns no matches
     /// (caller can validate the pattern separately for error UI).
@@ -513,7 +532,7 @@ mod tests {
 
     #[test]
     fn create_term() {
-        let term = ZmTerm::new(80, 24);
+        let term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK);
         assert!(term.is_ok());
         let term = term.unwrap();
         assert_eq!(term.cols(), 80);
@@ -522,7 +541,7 @@ mod tests {
 
     #[test]
     fn feed_plain_text() {
-        let mut term = ZmTerm::new(80, 24).unwrap();
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         term.feed_bytes(b"Hello, zm-mux!");
         let row = term.row_text(0);
         assert!(row.contains("Hello, zm-mux!"), "got: '{}'", row);
@@ -530,7 +549,7 @@ mod tests {
 
     #[test]
     fn feed_ansi_color() {
-        let mut term = ZmTerm::new(80, 24).unwrap();
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         term.feed_bytes(b"\x1b[31mERR\x1b[0m OK");
         let row = term.row_text(0);
         assert!(row.contains("ERR") && row.contains("OK"), "got: '{}'", row);
@@ -546,7 +565,7 @@ mod tests {
 
     #[test]
     fn feed_newline() {
-        let mut term = ZmTerm::new(80, 24).unwrap();
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         term.feed_bytes(b"line1\r\nline2");
         assert!(term.row_text(0).contains("line1"));
         assert!(term.row_text(1).contains("line2"));
@@ -554,7 +573,7 @@ mod tests {
 
     #[test]
     fn cursor_position() {
-        let mut term = ZmTerm::new(80, 24).unwrap();
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         term.feed_bytes(b"ABC");
         let (row, col) = term.cursor_position();
         assert_eq!(row, 0);
@@ -563,7 +582,7 @@ mod tests {
 
     #[test]
     fn resize_term() {
-        let mut term = ZmTerm::new(80, 24).unwrap();
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         term.resize(40, 12);
         assert_eq!(term.cols(), 40);
         assert_eq!(term.rows(), 12);
@@ -571,7 +590,7 @@ mod tests {
 
     #[test]
     fn bold_text() {
-        let mut term = ZmTerm::new(80, 24).unwrap();
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         term.feed_bytes(b"\x1b[1mBOLD\x1b[0m");
         let cell = term.render_cell(0, 0);
         assert_eq!(cell.c, 'B');
@@ -580,7 +599,7 @@ mod tests {
 
     #[test]
     fn osc_9_emits_notify_event() {
-        let mut term = ZmTerm::new(80, 24).unwrap();
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         term.feed_bytes(b"\x1b]9;Hello world\x07");
         let events = term.drain_osc_events();
         assert_eq!(events.len(), 1);
@@ -594,7 +613,7 @@ mod tests {
 
     #[test]
     fn osc_777_notify_emits_event() {
-        let mut term = ZmTerm::new(80, 24).unwrap();
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         term.feed_bytes(b"\x1b]777;notify;ZM Title;Hello\x07");
         let events = term.drain_osc_events();
         assert_eq!(events.len(), 1);
@@ -608,7 +627,7 @@ mod tests {
 
     #[test]
     fn osc_unrelated_codes_ignored() {
-        let mut term = ZmTerm::new(80, 24).unwrap();
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         // OSC 0 = title set; not notify, must not surface as OscEvent.
         term.feed_bytes(b"\x1b]0;set title\x07");
         let events = term.drain_osc_events();
@@ -617,7 +636,7 @@ mod tests {
 
     #[test]
     fn osc_9_empty_body_ignored() {
-        let mut term = ZmTerm::new(80, 24).unwrap();
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         term.feed_bytes(b"\x1b]9;\x07");
         let events = term.drain_osc_events();
         assert!(events.is_empty(), "empty OSC 9 should not emit");
@@ -625,7 +644,7 @@ mod tests {
 
     #[test]
     fn drain_clears_buffer() {
-        let mut term = ZmTerm::new(80, 24).unwrap();
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         term.feed_bytes(b"\x1b]9;a\x07\x1b]9;b\x07");
         let events1 = term.drain_osc_events();
         assert_eq!(events1.len(), 2);
@@ -635,7 +654,7 @@ mod tests {
 
     #[test]
     fn osc_777_short_form_ignored() {
-        let mut term = ZmTerm::new(80, 24).unwrap();
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         // urxvt OSC 777 with non-"notify" subtype — out of our scope.
         term.feed_bytes(b"\x1b]777;set;something\x07");
         let events = term.drain_osc_events();
@@ -644,7 +663,7 @@ mod tests {
 
     #[test]
     fn search_matches_literal() {
-        let mut term = ZmTerm::new(80, 24).unwrap();
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         term.feed_bytes(b"hello TODO world\r\nanother TODO line");
         let m = term.search("TODO");
         assert_eq!(m.len(), 2);
@@ -657,7 +676,7 @@ mod tests {
 
     #[test]
     fn search_supports_regex() {
-        let mut term = ZmTerm::new(80, 24).unwrap();
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         term.feed_bytes(b"err 42, err 7, info, err 100");
         let m = term.search(r"err \d+");
         assert_eq!(m.len(), 3);
@@ -665,21 +684,21 @@ mod tests {
 
     #[test]
     fn search_empty_pattern_returns_empty() {
-        let mut term = ZmTerm::new(80, 24).unwrap();
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         term.feed_bytes(b"some text here");
         assert!(term.search("").is_empty());
     }
 
     #[test]
     fn search_invalid_regex_returns_empty() {
-        let mut term = ZmTerm::new(80, 24).unwrap();
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         term.feed_bytes(b"some text");
         assert!(term.search("[unclosed").is_empty());
     }
 
     #[test]
     fn search_no_match_returns_empty() {
-        let mut term = ZmTerm::new(80, 24).unwrap();
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         term.feed_bytes(b"abcdef");
         assert!(term.search("zzz").is_empty());
     }

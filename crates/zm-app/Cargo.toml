@@ -6,13 +6,12 @@ license.workspace = true
 description = "zm-mux application entry point"
 
 [dependencies]
-zm-core = { path = "../zm-core" }
-zm-pty = { path = "../zm-pty" }
-zm-term = { path = "../zm-term" }
-zm-render = { path = "../zm-render" }
-zm-mux = { path = "../zm-mux" }
-zm-agent = { path = "../zm-agent" }
-zm-socket = { path = "../zm-socket" }
-winit = "0.30"
-portable-pty = "0.9"
+zm-core = { workspace = true }
+zm-pty = { workspace = true }
+zm-term = { workspace = true }
+zm-render = { workspace = true }
+zm-mux = { workspace = true }
+zm-agent = { workspace = true }
+zm-socket = { workspace = true }
+winit = { workspace = true }
 notify-rust = "4"

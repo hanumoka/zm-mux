@@ -33,7 +33,7 @@ zm-mux is an open-source terminal multiplexer designed for AI coding agents. It 
 ## Build
 
 ```bash
-# Prerequisites: Rust 1.80+
+# Prerequisites: Rust 1.85+ (workspace uses edition = "2024")
 cargo build --workspace
 
 # Run

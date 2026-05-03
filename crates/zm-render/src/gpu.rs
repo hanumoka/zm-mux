@@ -6,17 +6,13 @@ use cosmic_text::{
 };
 use glyphon::{Cache, Color, Resolution, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
 use winit::window::Window;
-use zm_core::{ZmError, ZmResult};
+use zm_core::{ColorsConfig, ZmError, ZmResult};
 
 use crate::gpu_rect::{push_rect, RectPipeline, RectVertex};
 use crate::{PaneRenderInfo, Renderer, TAB_BAR_HEIGHT_PX, TabBarInfo};
 
 const JETBRAINS_MONO_REGULAR: &[u8] =
     include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
-
-// Window outside-pane background. Stored as 8-bit sRGB; converted to linear
-// for wgpu LoadOp::Clear because our surface format is sRGB.
-const BG_OUTSIDE_SRGB: (u8, u8, u8) = (0x1a, 0x1a, 0x2e);
 
 // Default fg used when a glyph has no explicit color (cosmic-text fallback).
 const DEFAULT_FG_R: u8 = 0xCC;
@@ -63,6 +59,10 @@ pub struct GpuBackend {
     atlas: TextAtlas,
     text_renderer: TextRenderer,
     rect_pipeline: RectPipeline,
+
+    /// Window outside-pane background, pre-converted to linear space (the
+    /// surface format is sRGB, so wgpu's LoadOp::Clear takes linear values).
+    bg_outside_linear: wgpu::Color,
 }
 
 impl GpuBackend {
@@ -70,6 +70,7 @@ impl GpuBackend {
         window: Arc<Window>,
         font_size: f32,
         font_family: impl Into<String>,
+        colors: &ColorsConfig,
     ) -> ZmResult<Self> {
         let win_size = window.inner_size();
         let size = (win_size.width.max(1), win_size.height.max(1));
@@ -143,6 +144,14 @@ impl GpuBackend {
             .max(1);
         let cell_height = (line_height as usize).max(1);
 
+        let bg_rgb = colors.background_rgb();
+        let bg_outside_linear = wgpu::Color {
+            r: srgb_byte_to_linear(bg_rgb.0),
+            g: srgb_byte_to_linear(bg_rgb.1),
+            b: srgb_byte_to_linear(bg_rgb.2),
+            a: 1.0,
+        };
+
         Ok(Self {
             cell_width,
             cell_height,
@@ -159,6 +168,7 @@ impl GpuBackend {
             atlas,
             text_renderer,
             rect_pipeline,
+            bg_outside_linear,
         })
     }
 }
@@ -637,12 +647,7 @@ impl Renderer for GpuBackend {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: srgb_byte_to_linear(BG_OUTSIDE_SRGB.0),
-                            g: srgb_byte_to_linear(BG_OUTSIDE_SRGB.1),
-                            b: srgb_byte_to_linear(BG_OUTSIDE_SRGB.2),
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(self.bg_outside_linear),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

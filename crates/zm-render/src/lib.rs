@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use winit::window::Window;
-use zm_core::ZmResult;
+use zm_core::{ColorsConfig, ZmResult};
 use zm_term::ZmTerm;
 
 mod cpu;
@@ -97,31 +97,32 @@ pub trait Renderer {
 /// | unset / anything other than `cpu` | Default = try GpuBackend, fall back to CpuBackend on init failure |
 /// | `cpu` | Force CpuBackend even if GPU is available |
 ///
-/// Plus `ZM_RENDER_FORCE_INIT_FAIL=1` (test/CI only): when combined with
-/// `ZM_RENDER=gpu`, bypasses the real `GpuBackend::new` call so the
-/// fallback path is exercised end-to-end without needing an environment
-/// where wgpu actually fails to initialize.  This is the only way to
-/// verify the fallback chain on a developer machine where DX12/Metal
-/// always succeeds.
+/// Plus `ZM_RENDER_FORCE_INIT_FAIL=1` (test/CI only): bypasses the real
+/// `GpuBackend::new` call when the GPU path is selected so the fallback
+/// chain is exercised end-to-end without needing an environment where
+/// wgpu actually fails to initialize.  This is the only way to verify
+/// the fallback chain on a developer machine where DX12/Metal always
+/// succeeds.  Has no effect when `ZM_RENDER=cpu` (the GPU path is not
+/// even attempted).
 pub fn create_renderer(
     window: Arc<Window>,
     font_size: f32,
     font_family: &str,
+    colors: &ColorsConfig,
 ) -> ZmResult<Box<dyn Renderer>> {
     let mode = std::env::var("ZM_RENDER")
         .unwrap_or_default()
         .to_ascii_lowercase();
     let force_cpu = mode == "cpu";
-    let prefer_gpu = !force_cpu;
     let force_init_fail = std::env::var("ZM_RENDER_FORCE_INIT_FAIL").is_ok();
 
-    if !force_cpu && prefer_gpu {
+    if !force_cpu {
         if force_init_fail {
             eprintln!(
                 "zm-render: GpuBackend init forced to fail (ZM_RENDER_FORCE_INIT_FAIL); falling back to CpuBackend"
             );
         } else {
-            match GpuBackend::new(window.clone(), font_size, font_family) {
+            match GpuBackend::new(window.clone(), font_size, font_family, colors) {
                 Ok(gpu) => {
                     eprintln!("zm-render: using GpuBackend (wgpu + glyphon)");
                     return Ok(Box::new(gpu));
@@ -135,7 +136,7 @@ pub fn create_renderer(
         }
     }
 
-    let cpu = CpuBackend::new(window, font_size, font_family)?;
+    let cpu = CpuBackend::new(window, font_size, font_family, colors)?;
     eprintln!("zm-render: using CpuBackend (softbuffer + cosmic-text)");
     Ok(Box::new(cpu))
 }

@@ -1,6 +1,6 @@
 use portable_pty::{CommandBuilder, MasterPty, PtySize, SlavePty, native_pty_system};
 use std::io::{Read, Write};
-use zm_core::{ZmError, ZmResult};
+use zm_core::{ShellConfig, ZmError, ZmResult};
 
 pub struct ZmPtyProcess {
     reader: Option<Box<dyn Read + Send>>,
@@ -10,7 +10,21 @@ pub struct ZmPtyProcess {
     _slave: Box<dyn SlavePty + Send>,
 }
 
-pub fn spawn_pty(rows: u16, cols: u16, cmd: CommandBuilder) -> ZmResult<ZmPtyProcess> {
+/// Spawn a PTY running the shell described by `shell`.  An empty
+/// `program` falls back to `portable_pty::CommandBuilder::new_default_prog`
+/// which picks `cmd.exe` on Windows and `$SHELL` (or `/bin/sh`) on
+/// POSIX hosts.
+pub fn spawn_pty(rows: u16, cols: u16, shell: &ShellConfig) -> ZmResult<ZmPtyProcess> {
+    let cmd = if shell.program.is_empty() {
+        CommandBuilder::new_default_prog()
+    } else {
+        let mut c = CommandBuilder::new(&shell.program);
+        for arg in &shell.args {
+            c.arg(arg);
+        }
+        c
+    };
+
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -46,8 +60,7 @@ pub fn spawn_pty(rows: u16, cols: u16, cmd: CommandBuilder) -> ZmResult<ZmPtyPro
 }
 
 pub fn spawn_default_shell(rows: u16, cols: u16) -> ZmResult<ZmPtyProcess> {
-    let cmd = CommandBuilder::new_default_prog();
-    spawn_pty(rows, cols, cmd)
+    spawn_pty(rows, cols, &ShellConfig::default())
 }
 
 impl ZmPtyProcess {
@@ -94,14 +107,21 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    fn test_shell() -> ShellConfig {
+        #[cfg(windows)]
+        let program = "cmd.exe".to_string();
+        #[cfg(not(windows))]
+        let program = "bash".to_string();
+        ShellConfig {
+            program,
+            args: Vec::new(),
+        }
+    }
+
     #[test]
     fn pty_spawn_and_read() {
-        #[cfg(windows)]
-        let cmd = CommandBuilder::new("cmd.exe");
-        #[cfg(not(windows))]
-        let cmd = CommandBuilder::new("bash");
-
-        let mut proc = spawn_pty(24, 80, cmd).expect("spawn should succeed");
+        let shell = test_shell();
+        let mut proc = spawn_pty(24, 80, &shell).expect("spawn should succeed");
         let reader = proc.take_reader().expect("reader");
 
         let (tx, rx) = mpsc::channel();
@@ -131,12 +151,8 @@ mod tests {
 
     #[test]
     fn pty_write_does_not_error() {
-        #[cfg(windows)]
-        let cmd = CommandBuilder::new("cmd.exe");
-        #[cfg(not(windows))]
-        let cmd = CommandBuilder::new("bash");
-
-        let mut proc = spawn_pty(24, 80, cmd).expect("spawn");
+        let shell = test_shell();
+        let mut proc = spawn_pty(24, 80, &shell).expect("spawn");
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         let result = proc.write_input(b"echo test\r\n");
@@ -147,12 +163,8 @@ mod tests {
 
     #[test]
     fn pty_kill() {
-        #[cfg(windows)]
-        let cmd = CommandBuilder::new("cmd.exe");
-        #[cfg(not(windows))]
-        let cmd = CommandBuilder::new("bash");
-
-        let mut proc = spawn_pty(24, 80, cmd).expect("spawn");
+        let shell = test_shell();
+        let mut proc = spawn_pty(24, 80, &shell).expect("spawn");
         assert!(
             proc.try_wait().unwrap().is_none(),
             "process should be running"
