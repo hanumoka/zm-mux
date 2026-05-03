@@ -1045,6 +1045,14 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
+                {
+                    let state = self.state.lock().unwrap();
+                    let snap = zm_mux::session::SessionSnapshot::from_tab_set(&state.tabs, "autosave");
+                    let path = zm_mux::session::sessions_dir().join("autosave.json");
+                    if let Err(e) = snap.save_to_file(&path) {
+                        eprintln!("zm-mux: session save failed: {e}");
+                    }
+                }
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
@@ -2085,6 +2093,67 @@ fn cli_main(args: &[String]) {
                 }
             }
         }
+        "save" => {
+            let name = args.get(2).map(|s| s.as_str()).unwrap_or("default");
+            let req = Request {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: RequestId::Num(1),
+                method: MuxMethod::ListPanes.as_str().to_string(),
+                params: serde_json::json!({}),
+            };
+            match client.call(&req) {
+                Ok((Response::Success(_), _)) => {
+                    use zm_mux::session::{SessionSnapshot, sessions_dir};
+                    let status_req = Request {
+                        jsonrpc: JSONRPC_VERSION.to_string(),
+                        id: RequestId::Num(2),
+                        method: MuxMethod::GetStatus.as_str().to_string(),
+                        params: serde_json::json!({}),
+                    };
+                    if let Ok((Response::Success(status_resp), _)) = client.call(&status_req) {
+                        let result: GetStatusResult =
+                            serde_json::from_value(status_resp.result).expect("parse");
+                        eprintln!("session save requires direct MuxState access (not yet via Socket API)");
+                        eprintln!("panes: {}, tabs: {}", result.pane_count, result.tab_count);
+                        eprintln!("hint: session save will be integrated into GUI mode in next iteration");
+                    }
+                }
+                Ok((Response::Error(e), _)) => {
+                    eprintln!("error: {}", e.error.message);
+                    std::process::exit(1);
+                }
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+            }
+        }
+        "sessions" => {
+            use zm_mux::session::sessions_dir;
+            let dir = sessions_dir();
+            if !dir.exists() {
+                println!("no saved sessions");
+            } else {
+                let mut found = false;
+                for entry in std::fs::read_dir(&dir).unwrap() {
+                    if let Ok(e) = entry {
+                        if e.path().extension().is_some_and(|ext| ext == "json") {
+                            let name = e.path().file_stem().unwrap().to_string_lossy().to_string();
+                            if let Ok(meta) = e.metadata() {
+                                let modified = meta.modified().ok()
+                                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                println!("{:<20} (modified: {})", name, modified);
+                            } else {
+                                println!("{name}");
+                            }
+                            found = true;
+                        }
+                    }
+                }
+                if !found {
+                    println!("no saved sessions");
+                }
+            }
+        }
         "--version" | "-V" => {
             println!("zm-mux {}", env!("CARGO_PKG_VERSION"));
         }
@@ -2102,8 +2171,10 @@ fn cli_main(args: &[String]) {
             println!("  zm-mux new-tab                         Create tab");
             println!("  zm-mux close-tab <tab_id>              Close tab");
             println!("  zm-mux agent-info <id> [type] [status] Set agent info");
-            println!("  zm-mux launch <agent1> [agent2] ...    Launch agents with worktrees");
+            println!("  zm-mux launch <agent1> [agent2] ...    Launch agents");
             println!("  zm-mux worktree list|cleanup            Manage worktrees");
+            println!("  zm-mux save [name]                     Save session layout");
+            println!("  zm-mux sessions                        List saved sessions");
             println!("  zm-mux --version                       Show version");
         }
         other => {

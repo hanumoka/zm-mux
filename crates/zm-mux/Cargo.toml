@@ -9,3 +9,5 @@ description = "Terminal multiplexer (session/window/tab/pane tree)"
 zm-core = { workspace = true }
 zm-pty = { workspace = true }
 zm-term = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

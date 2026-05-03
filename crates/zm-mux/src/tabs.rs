@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
+
 use crate::{PaneId, PaneTree};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TabId(pub u32);
 
 #[derive(Debug)]
@@ -158,6 +160,18 @@ impl TabSet {
         self.tabs
             .iter_mut()
             .find(|tab| tab.tree.pane_ids().contains(&pane_id))
+    }
+
+    pub fn next_tab_id(&self) -> u32 {
+        self.next_tab_id
+    }
+
+    pub fn next_pane_id(&self) -> u32 {
+        self.next_pane_id
+    }
+
+    pub fn restore(tabs: Vec<Tab>, active: TabId, next_tab_id: u32, next_pane_id: u32) -> Self {
+        Self { tabs, active, next_tab_id, next_pane_id }
     }
 
     /// Close a specific tab by ID.  Returns the PaneIds that lived in

@@ -1,11 +1,14 @@
+pub mod session;
 pub mod tabs;
 
 pub use tabs::{Tab, TabId, TabSet};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PaneId(pub u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SplitDirection {
     Horizontal,
     Vertical,
@@ -19,8 +22,8 @@ pub struct Rect {
     pub height: usize,
 }
 
-#[derive(Debug)]
-enum PaneNode {
+#[derive(Debug, Serialize, Deserialize)]
+pub enum PaneNode {
     Leaf(PaneId),
     Split {
         direction: SplitDirection,
@@ -33,6 +36,16 @@ enum PaneNode {
 #[derive(Debug)]
 pub struct PaneTree {
     root: PaneNode,
+}
+
+impl PaneTree {
+    pub fn root_node(&self) -> &PaneNode {
+        &self.root
+    }
+
+    pub fn from_node(root: PaneNode) -> Self {
+        Self { root }
+    }
 }
 
 impl PaneTree {
