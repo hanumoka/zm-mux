@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: zm-mux-windows-x64
+            ext: .exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: zm-mux-macos-arm64
+            ext: ""
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release -p zm-app -p zm-mux-mcp
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir dist
+          copy target\release\zm-mux.exe dist\
+          copy target\release\zm-mux-mcp.exe dist\
+          copy README.md dist\
+          copy LICENSE dist\
+          Compress-Archive -Path dist\* -DestinationPath ${{ matrix.artifact }}.zip
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir dist
+          cp target/release/zm-mux dist/
+          cp target/release/zm-mux-mcp dist/
+          cp README.md dist/
+          cp LICENSE dist/
+          tar czf ${{ matrix.artifact }}.tar.gz -C dist .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            --title "zm-mux ${{ github.ref_name }}" \
+            --generate-notes \
+            artifacts/**/*

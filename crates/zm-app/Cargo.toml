@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "zm-mux application entry point"
 
+[[bin]]
+name = "zm-mux"
+path = "src/main.rs"
+
 [dependencies]
 zm-core = { workspace = true }
 zm-pty = { workspace = true }
