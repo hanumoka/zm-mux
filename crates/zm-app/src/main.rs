@@ -16,7 +16,8 @@ use zm_core::{
 use zm_mux::{PaneId, SplitDirection, TabSet};
 use zm_pty::ZmPtyProcess;
 use zm_render::{
-    PaneRenderInfo, Rect, Renderer, TAB_BAR_HEIGHT_PX, TabBarInfo, TabLabel, create_renderer,
+    HighlightCell, PaneRenderInfo, Rect, Renderer, TAB_BAR_HEIGHT_PX, TabBarInfo, TabLabel,
+    create_renderer,
 };
 use zm_term::{OscEvent, ZmTerm};
 
@@ -299,6 +300,21 @@ fn winit_key_to_def(key: &Key) -> Option<KeyDef> {
     }
 }
 
+/// Search mode state.  Active = the focused pane's input is hijacked by
+/// the search dispatcher (Esc exits, n/N walk matches, printable chars
+/// extend the query, Backspace shrinks it).  `matches` is recomputed
+/// every time the query changes; it is purely a viewport overlay (no
+/// scrollback search yet).  `current` is the highlighted match index;
+/// for now we render every match the same color and rely on the user
+/// to scan visually -- per-match emphasis is a follow-up.
+#[derive(Default)]
+struct SearchState {
+    active: bool,
+    query: String,
+    matches: Vec<HighlightCell>,
+    current: usize,
+}
+
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Box<dyn Renderer>>,
@@ -312,6 +328,7 @@ struct App {
     /// IME composition is in progress.  Rendered as an overlay at the
     /// cursor position so cell grid stays clean — only Commit touches PTY.
     ime_preedit: Option<String>,
+    search: SearchState,
 }
 
 impl App {
@@ -330,7 +347,35 @@ impl App {
             notifier: NotifyDispatcher::new(),
             notify_gc_counter: 0,
             ime_preedit: None,
+            search: SearchState::default(),
         }
+    }
+
+    /// Re-run regex search against the focused pane's viewport and refresh
+    /// `self.search.matches`.  Called whenever the query changes (char
+    /// added/removed) or the user explicitly presses Enter.
+    fn do_research(&mut self) {
+        let raw = {
+            let state = self.state.lock().unwrap();
+            let focused = state.focused_pane();
+            state
+                .panes
+                .get(&focused)
+                .map(|ps| ps.term.search(&self.search.query))
+                .unwrap_or_default()
+        };
+        self.search.matches = raw
+            .into_iter()
+            .map(|m| HighlightCell {
+                row: m.row,
+                col: m.col,
+                len: m.len,
+            })
+            .collect();
+        if self.search.matches.is_empty() || self.search.current >= self.search.matches.len() {
+            self.search.current = 0;
+        }
+        self.state.lock().unwrap().dirty = true;
     }
 
     /// Cancel any in-flight IME composition.  Called whenever focus moves
@@ -372,6 +417,11 @@ impl App {
         let layouts = active.tree.layout(width as usize, pane_area_h);
         let focused = active.focused_pane;
         let preedit_str = self.ime_preedit.as_deref();
+        let active_highlights: &[HighlightCell] = if self.search.active {
+            &self.search.matches
+        } else {
+            &[]
+        };
         let pane_infos: Vec<PaneRenderInfo> = layouts
             .iter()
             .filter_map(|(id, mux_rect)| {
@@ -385,6 +435,7 @@ impl App {
                     },
                     focused: *id == focused,
                     ime_preedit: if *id == focused { preedit_str } else { None },
+                    highlights: if *id == focused { active_highlights } else { &[] },
                 })
             })
             .collect();
@@ -594,6 +645,36 @@ impl ApplicationHandler for App {
                 let mods_bits = winit_mods_to_bits(self.modifiers);
                 let key_def = winit_key_to_def(&event.logical_key);
 
+                // Search mode hijacks every keystroke until Esc.  This
+                // sits before the keybinding dispatcher so Ctrl+T etc.
+                // cannot accidentally fire while the user is typing a
+                // query.  Matches are recomputed live as the query grows
+                // — no Enter required.
+                if self.search.active {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) => {
+                            self.search.active = false;
+                            self.search.query.clear();
+                            self.search.matches.clear();
+                            self.search.current = 0;
+                            self.state.lock().unwrap().dirty = true;
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            self.search.query.pop();
+                            self.do_research();
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            self.do_research();
+                        }
+                        Key::Character(s) if mods_bits == ModBits::EMPTY => {
+                            self.search.query.push_str(s);
+                            self.do_research();
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+
                 // Scrollback navigation (Shift+PgUp/PgDn/Home/End) — kept
                 // hardcoded; tightly coupled to scroll API and unlikely to be
                 // user-rebound.
@@ -682,6 +763,14 @@ impl ApplicationHandler for App {
                     }
                     if kb.focus_down.matches(mods_bits, kd) {
                         self.do_focus(SplitDirection::Vertical, true);
+                        return;
+                    }
+                    if kb.search.matches(mods_bits, kd) {
+                        self.search.active = true;
+                        self.search.query.clear();
+                        self.search.matches.clear();
+                        self.search.current = 0;
+                        self.state.lock().unwrap().dirty = true;
                         return;
                     }
 

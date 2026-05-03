@@ -39,6 +39,11 @@ const IME_BG_SRGB: (u8, u8, u8) = (0x40, 0x40, 0x60);
 const IME_UNDERLINE_SRGB: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
 const IME_FG: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
 
+// Search highlight — yellow translucent (linear, ~0.39 alpha).  Drawn
+// after cell text and before the cursor outline rect so glyphs remain
+// readable through the highlight.
+const HL_LINEAR: [f32; 4] = [1.0, 1.0, 0.0, 0.39];
+
 /// GPU-accelerated renderer using wgpu + glyphon.
 pub struct GpuBackend {
     cell_width: usize,
@@ -471,10 +476,28 @@ impl Renderer for GpuBackend {
             }
         }
 
-        // Pane borders + cursor outlines.
+        // Pane borders + search highlights + cursor outlines.
         for pane in panes {
             let r = &pane.rect;
             let term = pane.term;
+
+            // Search highlights for this pane (translucent yellow).  Push
+            // first so cursor outline + border draw on top.
+            for h in pane.highlights {
+                let hx = r.x as i32 + h.col as i32 * self.cell_width as i32;
+                let hy = r.y as i32 + h.row as i32 * self.cell_height as i32;
+                let hw = h.len as i32 * self.cell_width as i32;
+                push_rect(
+                    &mut rect_verts,
+                    hx,
+                    hy,
+                    hw,
+                    self.cell_height as i32,
+                    HL_LINEAR,
+                    width,
+                    height,
+                );
+            }
 
             let border = if pane.focused {
                 border_focused

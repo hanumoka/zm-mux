@@ -32,6 +32,17 @@ pub struct PaneRenderInfo<'a> {
     /// draw it as an overlay at the cursor position so the cell grid
     /// stays untouched until the OS commits.
     pub ime_preedit: Option<&'a str>,
+    /// Search-result cells to overlay with a translucent highlight
+    /// (drawn on top of cell text, under the cursor outline).
+    pub highlights: &'a [HighlightCell],
+}
+
+/// One search-hit span in a pane's viewport, in cell units.
+#[derive(Debug, Clone, Copy)]
+pub struct HighlightCell {
+    pub row: usize,
+    pub col: usize,
+    pub len: usize,
 }
 
 /// One tab's display label.  The renderer draws the title text inside the

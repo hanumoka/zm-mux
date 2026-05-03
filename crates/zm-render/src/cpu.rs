@@ -8,7 +8,7 @@ use softbuffer::{Context, Surface};
 use winit::window::Window;
 use zm_core::{ZmError, ZmResult};
 
-use crate::{PaneRenderInfo, Rect, Renderer, TAB_BAR_HEIGHT_PX, TabBarInfo};
+use crate::{HighlightCell, PaneRenderInfo, Rect, Renderer, TAB_BAR_HEIGHT_PX, TabBarInfo};
 
 const JETBRAINS_MONO_REGULAR: &[u8] =
     include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
@@ -29,6 +29,11 @@ const IME_UNDERLINE: u32 = 0x00_FFFFFF;
 const IME_FG_R: u8 = 0xFF;
 const IME_FG_G: u8 = 0xFF;
 const IME_FG_B: u8 = 0xFF;
+// Yellow translucent search highlight (alpha 100/255 ≈ 39% opacity).
+const HL_R: u8 = 0xFF;
+const HL_G: u8 = 0xFF;
+const HL_B: u8 = 0x00;
+const HL_A: u8 = 100;
 
 // Shaping + rasterization state, separable from presentation surface
 // so the surface borrow in render() does not block draw access to these.
@@ -298,6 +303,13 @@ impl CellShaper {
             }
         }
 
+        // Search highlights — translucent yellow over the matched cells.
+        // Drawn after cell text but before the pane border so the border
+        // still wins at the edge.
+        for h in pane.highlights {
+            self.draw_highlight(r, h, buf, buf_width, buf_height);
+        }
+
         let border = if pane.focused {
             BORDER_FOCUSED
         } else {
@@ -311,6 +323,23 @@ impl CellShaper {
         {
             self.draw_ime_overlay(pane, preedit, buf, buf_width, buf_height);
         }
+    }
+
+    fn draw_highlight(
+        &self,
+        pane_rect: &Rect,
+        h: &HighlightCell,
+        buf: &mut [u32],
+        buf_width: usize,
+        buf_height: usize,
+    ) {
+        let hx = pane_rect.x + h.col * self.cell_width;
+        let hy = pane_rect.y + h.row * self.cell_height;
+        let hw = h.len * self.cell_width;
+        blend_rect(
+            buf, buf_width, buf_height, hx as i32, hy as i32, hw, self.cell_height,
+            HL_R, HL_G, HL_B, HL_A,
+        );
     }
 
     fn draw_ime_overlay(

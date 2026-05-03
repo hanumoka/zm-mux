@@ -9,3 +9,4 @@ description = "VT terminal emulation for zm-mux, wrapping alacritty_terminal"
 zm-core = { path = "../zm-core" }
 alacritty_terminal = "0.26"
 vte = "0.15"
+regex = "1"

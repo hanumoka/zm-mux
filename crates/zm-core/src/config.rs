@@ -33,6 +33,7 @@ pub struct KeyBindingsConfig {
     pub focus_right: String,
     pub focus_up: String,
     pub focus_down: String,
+    pub search: String,
 }
 
 impl Default for KeyBindingsConfig {
@@ -49,6 +50,7 @@ impl Default for KeyBindingsConfig {
             focus_right: "Alt+Right".to_string(),
             focus_up: "Alt+Up".to_string(),
             focus_down: "Alt+Down".to_string(),
+            search: "Ctrl+Shift+F".to_string(),
         }
     }
 }
@@ -66,6 +68,7 @@ pub struct ParsedKeyBindings {
     pub focus_right: KeyBinding,
     pub focus_up: KeyBinding,
     pub focus_down: KeyBinding,
+    pub search: KeyBinding,
 }
 
 impl KeyBindingsConfig {
@@ -89,6 +92,7 @@ impl KeyBindingsConfig {
             focus_right: p("focus_right", &self.focus_right)?,
             focus_up: p("focus_up", &self.focus_up)?,
             focus_down: p("focus_down", &self.focus_down)?,
+            search: p("search", &self.search)?,
         })
     }
 }

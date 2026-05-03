@@ -53,6 +53,16 @@ pub struct OscEvent {
     pub kind: OscEventKind,
 }
 
+/// One regex hit in a viewport row.  Coordinates are *cell-relative* —
+/// `row` and `col` are 0-based indices into the visible grid, `len` is
+/// the cell count the match occupies (wide chars count as 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub row: usize,
+    pub col: usize,
+    pub len: usize,
+}
+
 /// Sniffs OSC 9 / 777 sequences out of a parallel `vte::Parser` running
 /// alongside alacritty's parser.  All other OSC codes are silently
 /// ignored — alacritty handles the ones it cares about (title, color,
@@ -321,6 +331,70 @@ impl ZmTerm {
         (cursor.line.0 as usize, cursor.column.0)
     }
 
+    /// Search the visible viewport for a regex pattern.  Returns one match
+    /// per occurrence with viewport-relative `(row, col, len)` in *cell
+    /// units* (chars, not bytes — wide CJK glyphs count as 1 cell here;
+    /// the renderer is the layer that knows pixel widths).
+    ///
+    /// Empty pattern returns no matches.  Invalid regex returns no matches
+    /// (caller can validate the pattern separately for error UI).
+    /// Scrollback search is a follow-up: the alacritty grid line model
+    /// would need negative-index iteration here.
+    pub fn search(&self, pattern: &str) -> Vec<SearchMatch> {
+        if pattern.is_empty() {
+            return Vec::new();
+        }
+        let re = match regex::Regex::new(pattern) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let cols = self.cols();
+        let rows = self.rows();
+        let mut out = Vec::new();
+        for row in 0..rows {
+            // Materialize the row as a String so regex can scan it.
+            // Wide-char spacers contribute their counterpart cell's char,
+            // but we skip duplicates by matching against the leading char
+            // and counting the *cell* span separately during emit.
+            let mut text = String::with_capacity(cols);
+            let mut col_for_byte: Vec<usize> = Vec::with_capacity(cols);
+            for col in 0..cols {
+                if self.is_wide_spacer(row, col) {
+                    continue;
+                }
+                let cell = self.render_cell(row, col);
+                let c = if cell.c == '\0' { ' ' } else { cell.c };
+                let byte_start = text.len();
+                text.push(c);
+                for _ in byte_start..text.len() {
+                    col_for_byte.push(col);
+                }
+            }
+            for m in re.find_iter(&text) {
+                let start_col = col_for_byte
+                    .get(m.start())
+                    .copied()
+                    .unwrap_or(0);
+                // Width in cells: count chars in match, count wide chars twice.
+                let mut width_cells = 0usize;
+                let mut byte = m.start();
+                for ch in m.as_str().chars() {
+                    let col = col_for_byte.get(byte).copied().unwrap_or(start_col);
+                    width_cells += if self.is_wide_char(row, col) { 2 } else { 1 };
+                    byte += ch.len_utf8();
+                }
+                if width_cells > 0 {
+                    out.push(SearchMatch {
+                        row,
+                        col: start_col,
+                        len: width_cells,
+                    });
+                }
+            }
+        }
+        out
+    }
+
     pub fn display_offset(&self) -> usize {
         self.term.grid().display_offset()
     }
@@ -566,5 +640,47 @@ mod tests {
         term.feed_bytes(b"\x1b]777;set;something\x07");
         let events = term.drain_osc_events();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn search_matches_literal() {
+        let mut term = ZmTerm::new(80, 24).unwrap();
+        term.feed_bytes(b"hello TODO world\r\nanother TODO line");
+        let m = term.search("TODO");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].row, 0);
+        assert_eq!(m[0].col, 6);
+        assert_eq!(m[0].len, 4);
+        assert_eq!(m[1].row, 1);
+        assert_eq!(m[1].col, 8);
+    }
+
+    #[test]
+    fn search_supports_regex() {
+        let mut term = ZmTerm::new(80, 24).unwrap();
+        term.feed_bytes(b"err 42, err 7, info, err 100");
+        let m = term.search(r"err \d+");
+        assert_eq!(m.len(), 3);
+    }
+
+    #[test]
+    fn search_empty_pattern_returns_empty() {
+        let mut term = ZmTerm::new(80, 24).unwrap();
+        term.feed_bytes(b"some text here");
+        assert!(term.search("").is_empty());
+    }
+
+    #[test]
+    fn search_invalid_regex_returns_empty() {
+        let mut term = ZmTerm::new(80, 24).unwrap();
+        term.feed_bytes(b"some text");
+        assert!(term.search("[unclosed").is_empty());
+    }
+
+    #[test]
+    fn search_no_match_returns_empty() {
+        let mut term = ZmTerm::new(80, 24).unwrap();
+        term.feed_bytes(b"abcdef");
+        assert!(term.search("zzz").is_empty());
     }
 }
