@@ -1,18 +1,21 @@
 mod notify;
+mod selection;
 
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, Ime, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
+
+use selection::{CellCoord, SelectionState};
 
 use zm_core::{
     Config, KeyBindingsConfig, KeyDef, ModBits, ParsedKeyBindings, ShellConfig,
 };
-use zm_mux::{PaneId, SplitDirection, TabSet};
+use zm_mux::{BorderHit, PaneId, SplitDirection, TabSet};
 use zm_pty::ZmPtyProcess;
 use zm_render::{
     HighlightCell, PaneRenderInfo, Rect, Renderer, TAB_BAR_HEIGHT_PX, TabBarInfo, TabLabel,
@@ -356,6 +359,19 @@ struct App {
     /// cursor position so cell grid stays clean — only Commit touches PTY.
     ime_preedit: Option<String>,
     search: SearchState,
+    selection: SelectionState,
+    cursor_position: (f64, f64),
+    last_click_time: std::time::Instant,
+    click_count: u8,
+    resize_drag: Option<ResizeDrag>,
+    left_button_down: bool,
+    last_mouse_cell: Option<(PaneId, usize, usize)>,
+}
+
+struct ResizeDrag {
+    direction: SplitDirection,
+    start_x: usize,
+    start_y: usize,
 }
 
 impl App {
@@ -375,6 +391,13 @@ impl App {
             notify_gc_counter: 0,
             ime_preedit: None,
             search: SearchState::default(),
+            selection: SelectionState::default(),
+            cursor_position: (0.0, 0.0),
+            last_click_time: std::time::Instant::now(),
+            click_count: 0,
+            resize_drag: None,
+            left_button_down: false,
+            last_mouse_cell: None,
         }
     }
 
@@ -449,6 +472,15 @@ impl App {
         } else {
             &[]
         };
+        let sel_pane = self.selection.pane;
+        let sel_highlights: Vec<HighlightCell> = if self.selection.is_active() {
+            sel_pane
+                .and_then(|pid| state.panes.get(&pid))
+                .map(|ps| self.selection.to_highlights(ps.term.cols()))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let pane_infos: Vec<PaneRenderInfo> = layouts
             .iter()
             .filter_map(|(id, mux_rect)| {
@@ -463,6 +495,11 @@ impl App {
                     focused: *id == focused,
                     ime_preedit: if *id == focused { preedit_str } else { None },
                     highlights: if *id == focused { active_highlights } else { &[] },
+                    selection_highlights: if Some(*id) == sel_pane {
+                        &sel_highlights
+                    } else {
+                        &[]
+                    },
                 })
             })
             .collect();
@@ -555,8 +592,63 @@ impl App {
         }
         if moved.is_some() {
             self.ime_cancel();
+            self.selection.clear();
         }
     }
+
+    fn hit_test(&self, px_x: f64, px_y: f64) -> Option<(PaneId, usize, usize)> {
+        let renderer = self.renderer.as_deref()?;
+        let (cell_w, cell_h) = renderer.cell_size();
+        if cell_w == 0 || cell_h == 0 {
+            return None;
+        }
+        let (w, h) = self.pane_area_size();
+        let state = self.state.lock().unwrap();
+        let layouts = state.tabs.active().tree.layout(w, h);
+
+        let pane_area_y = px_y - TAB_BAR_HEIGHT_PX as f64;
+        if pane_area_y < 0.0 {
+            return None;
+        }
+
+        for (id, mux_rect) in &layouts {
+            let rx = mux_rect.x as f64;
+            let ry = mux_rect.y as f64;
+            let rw = mux_rect.width as f64;
+            let rh = mux_rect.height as f64;
+            if px_x >= rx && px_x < rx + rw && pane_area_y >= ry && pane_area_y < ry + rh {
+                let col = ((px_x - rx) / cell_w as f64).floor() as usize;
+                let row = ((pane_area_y - ry) / cell_h as f64).floor() as usize;
+                let ps = state.panes.get(id)?;
+                let col = col.min(ps.term.cols().saturating_sub(1));
+                let row = row.min(ps.term.rows().saturating_sub(1));
+                let col = if ps.term.is_wide_spacer(row, col) && col > 0 {
+                    col - 1
+                } else {
+                    col
+                };
+                return Some((*id, row, col));
+            }
+        }
+        None
+    }
+
+    fn border_hit_test(&self, px_x: f64, px_y: f64) -> Option<BorderHit> {
+        let pane_area_y = px_y - TAB_BAR_HEIGHT_PX as f64;
+        if pane_area_y < 0.0 {
+            return None;
+        }
+        let (w, h) = self.pane_area_size();
+        let state = self.state.lock().unwrap();
+        state.tabs.active().tree.border_hit_test(
+            px_x as usize, pane_area_y as usize, w, h, 8,
+        )
+    }
+}
+
+fn sgr_mouse_seq(btn: u8, col: usize, row: usize, pressed: bool) -> Vec<u8> {
+    let suffix = if pressed { 'M' } else { 'm' };
+    format!("\x1b[<{btn};{};{}{suffix}", col + 1, row + 1).into_bytes()
 }
 
 impl ApplicationHandler for App {
@@ -639,6 +731,244 @@ impl ApplicationHandler for App {
                     }
                 }
             },
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_position = (position.x, position.y);
+
+                // Priority 1: border resize drag
+                if let Some(ref drag) = self.resize_drag {
+                    let pane_y = position.y - TAB_BAR_HEIGHT_PX as f64;
+                    let drag_pos = match drag.direction {
+                        SplitDirection::Horizontal => position.x as usize,
+                        SplitDirection::Vertical => pane_y.max(0.0) as usize,
+                    };
+                    let (w, h) = self.pane_area_size();
+                    let (cell_w, cell_h) = self.renderer.as_deref()
+                        .map(|r| r.cell_size()).unwrap_or((10, 20));
+                    let min_px = match drag.direction {
+                        SplitDirection::Horizontal => cell_w * 2,
+                        SplitDirection::Vertical => cell_h * 2,
+                    };
+                    let start_x = drag.start_x;
+                    let start_y = drag.start_y;
+                    let mut state = self.state.lock().unwrap();
+                    if state.tabs.active_mut().tree.adjust_border(
+                        start_x, start_y, drag_pos, w, h, 500, min_px,
+                    ) {
+                        if let Some(renderer) = self.renderer.as_deref() {
+                            state.resize_all_panes(renderer, w, h);
+                        }
+                        state.dirty = true;
+                    }
+                    if let Some(ref mut drag) = self.resize_drag {
+                        match drag.direction {
+                            SplitDirection::Horizontal => drag.start_x = drag_pos,
+                            SplitDirection::Vertical => drag.start_y = drag_pos,
+                        }
+                    }
+                    return;
+                }
+
+                // Priority 2: selection drag
+                if self.selection.dragging {
+                    if let Some((pane_id, row, col)) = self.hit_test(position.x, position.y) {
+                        if self.selection.pane == Some(pane_id) {
+                            self.selection.extend(CellCoord { row, col });
+                            self.state.lock().unwrap().dirty = true;
+                        }
+                    }
+                    return;
+                }
+
+                // Priority 3: mouse motion forwarding to PTY
+                if self.left_button_down || {
+                    let state = self.state.lock().unwrap();
+                    let focused = state.focused_pane();
+                    state.panes.get(&focused).map(|ps| ps.term.is_mouse_motion()).unwrap_or(false)
+                } {
+                    if let Some((pane_id, row, col)) = self.hit_test(position.x, position.y) {
+                        if self.last_mouse_cell != Some((pane_id, row, col)) {
+                            self.last_mouse_cell = Some((pane_id, row, col));
+                            let mut state = self.state.lock().unwrap();
+                            let focused = state.focused_pane();
+                            if pane_id == focused {
+                                if let Some(ps) = state.panes.get_mut(&focused) {
+                                    if ps.term.is_mouse_enabled() {
+                                        let btn = if self.left_button_down { 32u8 } else { 35 };
+                                        let seq = sgr_mouse_seq(btn, col, row, true);
+                                        let _ = ps.pty.write_input(&seq);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // Priority 4: border hover cursor
+                if let Some(hit) = self.border_hit_test(position.x, position.y) {
+                    let icon = match hit.direction {
+                        SplitDirection::Horizontal => CursorIcon::ColResize,
+                        SplitDirection::Vertical => CursorIcon::RowResize,
+                    };
+                    if let Some(w) = &self.window {
+                        w.set_cursor(icon);
+                    }
+                } else if let Some(w) = &self.window {
+                    w.set_cursor(CursorIcon::Default);
+                }
+            }
+            WindowEvent::MouseInput {
+                state: button_state,
+                button,
+                ..
+            } => {
+                let is_left = button == MouseButton::Left;
+                if is_left {
+                    match button_state {
+                        ElementState::Pressed => self.left_button_down = true,
+                        ElementState::Released => self.left_button_down = false,
+                    }
+                }
+
+                let (px_x, px_y) = self.cursor_position;
+
+                match button_state {
+                    ElementState::Pressed => {
+                        // Priority 1: border resize (left button only)
+                        if is_left {
+                            if let Some(hit) = self.border_hit_test(px_x, px_y) {
+                                let pane_y = (px_y - TAB_BAR_HEIGHT_PX as f64).max(0.0);
+                                self.resize_drag = Some(ResizeDrag {
+                                    direction: hit.direction,
+                                    start_x: px_x as usize,
+                                    start_y: pane_y.max(0.0) as usize,
+                                });
+                                return;
+                            }
+                        }
+
+                        // Priority 2: Shift held → bypass mouse tracking, do selection
+                        let shift_held = self.modifiers.contains(ModifiersState::SHIFT);
+
+                        // Priority 3: forward to PTY if mouse tracking active
+                        if !shift_held {
+                            let should_forward = {
+                                let state = self.state.lock().unwrap();
+                                let focused = state.focused_pane();
+                                state.panes.get(&focused)
+                                    .map(|ps| ps.term.is_mouse_enabled())
+                                    .unwrap_or(false)
+                            };
+                            if should_forward {
+                                if let Some((pane_id, row, col)) = self.hit_test(px_x, px_y) {
+                                    let mut state = self.state.lock().unwrap();
+                                    let focused = state.focused_pane();
+                                    if pane_id == focused {
+                                        if let Some(ps) = state.panes.get_mut(&focused) {
+                                            let btn = match button {
+                                                MouseButton::Left => 0u8,
+                                                MouseButton::Middle => 1,
+                                                MouseButton::Right => 2,
+                                                _ => return,
+                                            };
+                                            let seq = sgr_mouse_seq(btn, col, row, true);
+                                            let _ = ps.pty.write_input(&seq);
+                                        }
+                                    }
+                                }
+                                return;
+                            }
+                        }
+
+                        // Priority 4: selection (left button only)
+                        if is_left {
+                            if let Some((pane_id, row, col)) = self.hit_test(px_x, px_y) {
+                                let now = std::time::Instant::now();
+                                let elapsed = now.duration_since(self.last_click_time);
+                                if elapsed < std::time::Duration::from_millis(500) {
+                                    self.click_count = (self.click_count % 3) + 1;
+                                } else {
+                                    self.click_count = 1;
+                                }
+                                self.last_click_time = now;
+
+                                let coord = CellCoord { row, col };
+                                match self.click_count {
+                                    1 => self.selection.start(pane_id, coord),
+                                    2 => {
+                                        let chars: Vec<char> = {
+                                            let state = self.state.lock().unwrap();
+                                            state.panes.get(&pane_id)
+                                                .map(|ps| {
+                                                    (0..ps.term.cols())
+                                                        .map(|c| {
+                                                            let cell = ps.term.render_cell(row, c);
+                                                            if cell.c == '\0' { ' ' } else { cell.c }
+                                                        })
+                                                        .collect()
+                                                })
+                                                .unwrap_or_default()
+                                        };
+                                        let total_cols = chars.len();
+                                        self.selection.select_word(pane_id, coord, total_cols, |_, c| {
+                                            chars.get(c).copied().unwrap_or(' ')
+                                        });
+                                    }
+                                    3 => {
+                                        let total_cols = {
+                                            let state = self.state.lock().unwrap();
+                                            state.panes.get(&pane_id)
+                                                .map(|ps| ps.term.cols())
+                                                .unwrap_or(80)
+                                        };
+                                        self.selection.select_line(pane_id, row, total_cols);
+                                    }
+                                    _ => {}
+                                }
+                                self.state.lock().unwrap().dirty = true;
+                            }
+                        }
+                    }
+                    ElementState::Released => {
+                        if self.resize_drag.is_some() {
+                            self.resize_drag = None;
+                            return;
+                        }
+                        // Forward release to PTY if mouse tracking
+                        if !self.modifiers.contains(ModifiersState::SHIFT) {
+                            let should_forward = {
+                                let state = self.state.lock().unwrap();
+                                let focused = state.focused_pane();
+                                state.panes.get(&focused)
+                                    .map(|ps| ps.term.is_mouse_enabled())
+                                    .unwrap_or(false)
+                            };
+                            if should_forward {
+                                if let Some((pane_id, row, col)) = self.hit_test(px_x, px_y) {
+                                    let mut state = self.state.lock().unwrap();
+                                    let focused = state.focused_pane();
+                                    if pane_id == focused {
+                                        if let Some(ps) = state.panes.get_mut(&focused) {
+                                            let btn = match button {
+                                                MouseButton::Left => 0u8,
+                                                MouseButton::Middle => 1,
+                                                MouseButton::Right => 2,
+                                                _ => return,
+                                            };
+                                            let seq = sgr_mouse_seq(btn, col, row, false);
+                                            let _ = ps.pty.write_input(&seq);
+                                        }
+                                    }
+                                }
+                                return;
+                            }
+                        }
+                        if self.selection.dragging {
+                            self.selection.finalize();
+                        }
+                    }
+                }
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y.round() as i32 * 3,
@@ -647,14 +977,46 @@ impl ApplicationHandler for App {
                 if lines == 0 {
                     return;
                 }
+
+                // Determine mode BEFORE locking for write
+                let hit = self.hit_test(self.cursor_position.0, self.cursor_position.1);
+                let mouse_mode = {
+                    let state = self.state.lock().unwrap();
+                    let focused = state.focused_pane();
+                    state.panes.get(&focused).map(|ps| {
+                        (ps.term.is_mouse_enabled(), ps.term.is_alt_screen() && ps.term.is_alternate_scroll())
+                    }).unwrap_or((false, false))
+                };
+
                 let mut state = self.state.lock().unwrap();
                 let focused = state.focused_pane();
                 if let Some(ps) = state.panes.get_mut(&focused) {
-                    ps.term.scroll_lines(lines);
-                    state.dirty = true;
+                    if mouse_mode.0 {
+                        let btn = if lines > 0 { 64u8 } else { 65 };
+                        if let Some((pane_id, row, col)) = hit {
+                            if pane_id == focused {
+                                let count = lines.unsigned_abs();
+                                for _ in 0..count.min(10) {
+                                    let seq = sgr_mouse_seq(btn, col, row, true);
+                                    let _ = ps.pty.write_input(&seq);
+                                }
+                            }
+                        }
+                    } else if mouse_mode.1 {
+                        let key = if lines > 0 { b"\x1b[A" as &[u8] } else { b"\x1b[B" };
+                        let count = lines.unsigned_abs();
+                        for _ in 0..count.min(10) {
+                            let _ = ps.pty.write_input(key);
+                        }
+                    } else {
+                        self.selection.clear();
+                        ps.term.scroll_lines(lines);
+                        state.dirty = true;
+                    }
                 }
             }
             WindowEvent::Resized(_) => {
+                self.selection.clear();
                 let (w, h) = self.pane_area_size();
                 if let Some(renderer) = self.renderer_ref() {
                     let mut state = self.state.lock().unwrap();
@@ -747,11 +1109,13 @@ impl ApplicationHandler for App {
                         };
                         start_reader(new_pane, &self.state);
                         self.ime_cancel();
+                        self.selection.clear();
                         return;
                     }
                     if kb.close_tab.matches(mods_bits, kd) {
                         self.state.lock().unwrap().close_active_tab();
                         self.ime_cancel();
+                        self.selection.clear();
                         return;
                     }
                     if kb.close_pane.matches(mods_bits, kd) {
@@ -770,11 +1134,13 @@ impl ApplicationHandler for App {
                     if kb.next_tab.matches(mods_bits, kd) {
                         self.state.lock().unwrap().switch_tab_next();
                         self.ime_cancel();
+                        self.selection.clear();
                         return;
                     }
                     if kb.prev_tab.matches(mods_bits, kd) {
                         self.state.lock().unwrap().switch_tab_prev();
                         self.ime_cancel();
+                        self.selection.clear();
                         return;
                     }
                     if kb.focus_left.matches(mods_bits, kd) {
@@ -804,6 +1170,71 @@ impl ApplicationHandler for App {
                         self.state.lock().unwrap().dirty = true;
                         return;
                     }
+                    if kb.copy.matches(mods_bits, kd) {
+                        if self.selection.is_active() {
+                            if let Some(sel_pane) = self.selection.pane {
+                                let (start, end) = self.selection.ordered();
+                                let text = {
+                                    let state = self.state.lock().unwrap();
+                                    state
+                                        .panes
+                                        .get(&sel_pane)
+                                        .map(|ps| {
+                                            ps.term
+                                                .extract_text(start.row, start.col, end.row, end.col)
+                                        })
+                                        .unwrap_or_default()
+                                };
+                                if !text.is_empty() {
+                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                        let _ = clipboard.set_text(&text);
+                                    }
+                                }
+                            }
+                            self.selection.clear();
+                            self.state.lock().unwrap().dirty = true;
+                        }
+                        return;
+                    }
+                    if kb.paste.matches(mods_bits, kd) {
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            if let Ok(text) = clipboard.get_text() {
+                                if !text.is_empty() {
+                                    let mut state = self.state.lock().unwrap();
+                                    let focused = state.focused_pane();
+                                    if let Some(ps) = state.panes.get_mut(&focused) {
+                                        let _ = ps.pty.write_input(b"\x1b[200~");
+                                        let _ = ps.pty.write_input(text.as_bytes());
+                                        let _ = ps.pty.write_input(b"\x1b[201~");
+                                    }
+                                }
+                            }
+                        }
+                        self.selection.clear();
+                        return;
+                    }
+                    if kb.select_all.matches(mods_bits, kd) {
+                        let (rows, cols, focused) = {
+                            let state = self.state.lock().unwrap();
+                            let f = state.focused_pane();
+                            state
+                                .panes
+                                .get(&f)
+                                .map(|ps| (ps.term.rows(), ps.term.cols(), f))
+                                .unwrap_or((0, 0, f))
+                        };
+                        if rows > 0 && cols > 0 {
+                            self.selection.pane = Some(focused);
+                            self.selection.anchor = CellCoord { row: 0, col: 0 };
+                            self.selection.extent = CellCoord {
+                                row: rows.saturating_sub(1),
+                                col: cols.saturating_sub(1),
+                            };
+                            self.selection.dragging = false;
+                            self.state.lock().unwrap().dirty = true;
+                        }
+                        return;
+                    }
 
                     // Ctrl+1..9 — direct tab index, kept out of config.
                     if mods_bits == ModBits::CTRL
@@ -819,6 +1250,8 @@ impl ApplicationHandler for App {
                         return;
                     }
                 }
+
+                self.selection.clear();
 
                 // Plain key input → focused pane in active tab.
                 let bytes: Vec<u8> = match &event.logical_key {

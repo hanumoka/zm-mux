@@ -34,6 +34,9 @@ pub struct KeyBindingsConfig {
     pub focus_up: String,
     pub focus_down: String,
     pub search: String,
+    pub copy: String,
+    pub paste: String,
+    pub select_all: String,
 }
 
 impl Default for KeyBindingsConfig {
@@ -51,6 +54,9 @@ impl Default for KeyBindingsConfig {
             focus_up: "Alt+Up".to_string(),
             focus_down: "Alt+Down".to_string(),
             search: "Ctrl+Shift+F".to_string(),
+            copy: "Ctrl+Shift+C".to_string(),
+            paste: "Ctrl+Shift+V".to_string(),
+            select_all: "Ctrl+Shift+A".to_string(),
         }
     }
 }
@@ -69,6 +75,9 @@ pub struct ParsedKeyBindings {
     pub focus_up: KeyBinding,
     pub focus_down: KeyBinding,
     pub search: KeyBinding,
+    pub copy: KeyBinding,
+    pub paste: KeyBinding,
+    pub select_all: KeyBinding,
 }
 
 impl KeyBindingsConfig {
@@ -93,6 +102,9 @@ impl KeyBindingsConfig {
             focus_up: p("focus_up", &self.focus_up)?,
             focus_down: p("focus_down", &self.focus_down)?,
             search: p("search", &self.search)?,
+            copy: p("copy", &self.copy)?,
+            paste: p("paste", &self.paste)?,
+            select_all: p("select_all", &self.select_all)?,
         })
     }
 }

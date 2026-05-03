@@ -35,6 +35,8 @@ pub struct PaneRenderInfo<'a> {
     /// Search-result cells to overlay with a translucent highlight
     /// (drawn on top of cell text, under the cursor outline).
     pub highlights: &'a [HighlightCell],
+    /// Selection cells to overlay with a translucent blue highlight.
+    pub selection_highlights: &'a [HighlightCell],
 }
 
 /// One search-hit span in a pane's viewport, in cell units.

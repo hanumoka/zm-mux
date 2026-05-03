@@ -344,6 +344,44 @@ impl ZmTerm {
             .to_string()
     }
 
+    pub fn extract_text(
+        &self,
+        start_row: usize,
+        start_col: usize,
+        end_row: usize,
+        end_col: usize,
+    ) -> String {
+        let (sr, sc, er, ec) = if (start_row, start_col) <= (end_row, end_col) {
+            (start_row, start_col, end_row, end_col)
+        } else {
+            (end_row, end_col, start_row, start_col)
+        };
+        let max_row = self.rows().saturating_sub(1);
+        let max_col = self.cols().saturating_sub(1);
+        let mut lines = Vec::new();
+        for row in sr..=er.min(max_row) {
+            let c0 = if row == sr { sc } else { 0 };
+            let c1 = if row == er { ec.min(max_col) } else { max_col };
+            let mut line = String::new();
+            let mut col = c0;
+            while col <= c1 {
+                if self.is_wide_spacer(row, col) {
+                    col += 1;
+                    continue;
+                }
+                let cell = self.render_cell(row, col);
+                let c = if cell.c == '\0' { ' ' } else { cell.c };
+                line.push(c);
+                col += 1;
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
     pub fn cursor_position(&self) -> (usize, usize) {
         let cursor = self.term.grid().cursor.point;
         (cursor.line.0 as usize, cursor.column.0)
@@ -463,6 +501,36 @@ impl ZmTerm {
         }
         let cell = &self.term.grid()[Line(row as i32)][Column(col)];
         cell.flags.contains(Flags::WIDE_CHAR)
+    }
+
+    pub fn is_mouse_enabled(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    pub fn is_sgr_mouse(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().contains(TermMode::SGR_MOUSE)
+    }
+
+    pub fn is_mouse_motion(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().contains(TermMode::MOUSE_MOTION)
+    }
+
+    pub fn is_mouse_drag(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().contains(TermMode::MOUSE_DRAG)
+    }
+
+    pub fn is_alt_screen(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    pub fn is_alternate_scroll(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().contains(TermMode::ALTERNATE_SCROLL)
     }
 }
 
@@ -701,5 +769,54 @@ mod tests {
         let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
         term.feed_bytes(b"abcdef");
         assert!(term.search("zzz").is_empty());
+    }
+
+    #[test]
+    fn korean_wide_char_grid() {
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
+        term.feed_bytes("AB오전CD".as_bytes());
+
+        assert_eq!(term.render_cell(0, 0).c, 'A');
+        assert_eq!(term.render_cell(0, 1).c, 'B');
+
+        assert_eq!(term.render_cell(0, 2).c, '오');
+        assert!(term.is_wide_char(0, 2));
+        assert!(term.is_wide_spacer(0, 3));
+
+        assert_eq!(term.render_cell(0, 4).c, '전');
+        assert!(term.is_wide_char(0, 4));
+        assert!(term.is_wide_spacer(0, 5));
+
+        assert_eq!(term.render_cell(0, 6).c, 'C');
+        assert_eq!(term.render_cell(0, 7).c, 'D');
+    }
+
+    #[test]
+    fn mouse_mode_default_off() {
+        let term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
+        assert!(!term.is_mouse_enabled());
+        assert!(!term.is_sgr_mouse());
+        assert!(!term.is_alt_screen());
+    }
+
+    #[test]
+    fn mouse_mode_enable_disable() {
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
+        term.feed_bytes(b"\x1b[?1000h");
+        assert!(term.is_mouse_enabled());
+        term.feed_bytes(b"\x1b[?1006h");
+        assert!(term.is_sgr_mouse());
+        term.feed_bytes(b"\x1b[?1000l");
+        assert!(!term.is_mouse_enabled());
+    }
+
+    #[test]
+    fn alt_screen_mode() {
+        let mut term = ZmTerm::new(80, 24, 10_000, CellColor::WHITE, CellColor::BLACK).unwrap();
+        assert!(!term.is_alt_screen());
+        term.feed_bytes(b"\x1b[?1049h");
+        assert!(term.is_alt_screen());
+        term.feed_bytes(b"\x1b[?1049l");
+        assert!(!term.is_alt_screen());
     }
 }

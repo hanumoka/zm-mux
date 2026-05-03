@@ -34,6 +34,11 @@ const HL_G: u8 = 0xFF;
 const HL_B: u8 = 0x00;
 const HL_A: u8 = 100;
 
+const SEL_R: u8 = 0x33;
+const SEL_G: u8 = 0x66;
+const SEL_B: u8 = 0xFF;
+const SEL_A: u8 = 100;
+
 // Shaping + rasterization state, separable from presentation surface
 // so the surface borrow in render() does not block draw access to these.
 struct CellShaper {
@@ -61,7 +66,7 @@ impl CellShaper {
         {
             let mut bw = probe.borrow_with(&mut font_system);
             bw.set_size(None, Some(line_height));
-            bw.set_text("M", &probe_attrs, Shaping::Basic, None);
+            bw.set_text("M", &probe_attrs, Shaping::Advanced, None);
             bw.shape_until_scroll(false);
         }
         let cell_width = probe
@@ -169,7 +174,7 @@ impl CellShaper {
             {
                 let mut bw = self.cell_buffer.borrow_with(&mut self.font_system);
                 bw.set_size(Some(text_w), Some(bar_h as f32));
-                bw.set_text(label.title, &attrs, Shaping::Basic, None);
+                bw.set_text(label.title, &attrs, Shaping::Advanced, None);
                 bw.shape_until_scroll(false);
             }
             let fg_color = Color::rgb(FG_TAB_R, FG_TAB_G, FG_TAB_B);
@@ -258,7 +263,7 @@ impl CellShaper {
                 {
                     let mut bw = self.cell_buffer.borrow_with(&mut self.font_system);
                     bw.set_size(Some(cw as f32), Some(self.cell_height as f32));
-                    bw.set_text(&text, &attrs, Shaping::Basic, None);
+                    bw.set_text(&text, &attrs, Shaping::Advanced, None);
                     bw.shape_until_scroll(false);
                 }
                 let fg_color = Color::rgb(cell.fg.r, cell.fg.g, cell.fg.b);
@@ -309,6 +314,16 @@ impl CellShaper {
         // still wins at the edge.
         for h in pane.highlights {
             self.draw_highlight(r, h, buf, buf_width, buf_height);
+        }
+
+        for h in pane.selection_highlights {
+            let hx = r.x + h.col * self.cell_width;
+            let hy = r.y + h.row * self.cell_height;
+            let hw = h.len * self.cell_width;
+            blend_rect(
+                buf, buf_width, buf_height, hx as i32, hy as i32, hw, self.cell_height,
+                SEL_R, SEL_G, SEL_B, SEL_A,
+            );
         }
 
         let border = if pane.focused {
@@ -372,7 +387,7 @@ impl CellShaper {
         {
             let mut bw = self.cell_buffer.borrow_with(&mut self.font_system);
             bw.set_size(Some(est_w as f32), Some(self.cell_height as f32));
-            bw.set_text(preedit, &attrs, Shaping::Basic, None);
+            bw.set_text(preedit, &attrs, Shaping::Advanced, None);
             bw.shape_until_scroll(false);
         }
         let fg_color = Color::rgb(IME_FG_R, IME_FG_G, IME_FG_B);

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use cosmic_text::{
-    Attrs, AttrsList, Buffer, Color as CTColor, Family, FontSystem, Metrics, Shaping, Style,
+    Attrs, Buffer, Color as CTColor, Family, FontSystem, Metrics, Shaping, Style,
     Weight, Wrap,
 };
 use glyphon::{Cache, Color, Resolution, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
@@ -39,6 +39,7 @@ const IME_FG: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
 // after cell text and before the cursor outline rect so glyphs remain
 // readable through the highlight.
 const HL_LINEAR: [f32; 4] = [1.0, 1.0, 0.0, 0.39];
+const SEL_LINEAR: [f32; 4] = [0.0082, 0.0452, 1.0, 0.39];
 
 /// GPU-accelerated renderer using wgpu + glyphon.
 pub struct GpuBackend {
@@ -133,7 +134,7 @@ impl GpuBackend {
         {
             let mut bw = probe.borrow_with(&mut font_system);
             bw.set_size(None, Some(line_height));
-            bw.set_text("M", &probe_attrs, Shaping::Basic, None);
+            bw.set_text("M", &probe_attrs, Shaping::Advanced, None);
             bw.shape_until_scroll(false);
         }
         let cell_width = probe
@@ -219,21 +220,35 @@ impl Renderer for GpuBackend {
         self.viewport
             .update(&self.queue, Resolution { width, height });
 
-        // Build per-pane Buffers with rich text (per-cell fg color / bold /
-        // italic spans).  Buffers must outlive text_renderer.prepare and the
-        // render pass that calls text_renderer.render.
+        // Build per-cell Buffers for each non-empty cell.  Each cell is
+        // positioned at its exact grid coordinate so CJK wide characters
+        // don't shift subsequent glyphs.
         let line_height = (self.font_size * 1.4).ceil();
         let metrics = Metrics::new(self.font_size, line_height);
         let font_family = self.font_family.clone();
-        let mut pane_buffers: Vec<Buffer> = Vec::with_capacity(panes.len());
 
-        for pane in panes {
+        struct CellBuf {
+            buffer: Buffer,
+            x: f32,
+            y: f32,
+            pane_idx: usize,
+        }
+        struct CellBg {
+            x: i32,
+            y: i32,
+            w: i32,
+            h: i32,
+            color: [f32; 4],
+        }
+        let mut cell_buffers: Vec<CellBuf> = Vec::new();
+        let mut cell_bgs: Vec<CellBg> = Vec::new();
+
+        for (pi, pane) in panes.iter().enumerate() {
             let term = pane.term;
-            let default_attrs = Attrs::new().family(Family::Name(&font_family));
-
-            let mut text = String::new();
-            let mut byte_spans: Vec<(std::ops::Range<usize>, CTColor, bool, bool)> = Vec::new();
-            let mut byte_pos = 0usize;
+            let rx = pane.rect.x as f32;
+            let ry = pane.rect.y as f32;
+            let cw = self.cell_width as f32;
+            let ch = self.cell_height as f32;
 
             for row in 0..term.rows() {
                 for col in 0..term.cols() {
@@ -241,53 +256,56 @@ impl Renderer for GpuBackend {
                         continue;
                     }
                     let cell = term.render_cell(row, col);
-                    let c = if cell.c == '\0' { ' ' } else { cell.c };
-                    let n = c.len_utf8();
-                    text.push(c);
-                    byte_spans.push((
-                        byte_pos..byte_pos + n,
-                        CTColor::rgb(cell.fg.r, cell.fg.g, cell.fg.b),
-                        cell.bold,
-                        cell.italic,
-                    ));
-                    byte_pos += n;
-                }
-                text.push('\n');
-                byte_pos += 1;
-            }
+                    let is_wide = term.is_wide_char(row, col);
+                    let buf_w = if is_wide { cw * 2.0 } else { cw };
+                    let x = rx + col as f32 * cw;
+                    let y = ry + row as f32 * ch;
 
-            let mut attrs_list = AttrsList::new(&default_attrs);
-            for (range, color, bold, italic) in &byte_spans {
-                let mut a = Attrs::new().family(Family::Name(&font_family)).color(*color);
-                if *bold {
-                    a = a.weight(Weight::BOLD);
-                }
-                if *italic {
-                    a = a.style(Style::Italic);
-                }
-                attrs_list.add_span(range.clone(), &a);
-            }
+                    if cell.bg.r > 0 || cell.bg.g > 0 || cell.bg.b > 0 {
+                        cell_bgs.push(CellBg {
+                            x: x as i32,
+                            y: y as i32,
+                            w: buf_w as i32,
+                            h: ch as i32,
+                            color: [
+                                srgb_byte_to_linear(cell.bg.r) as f32,
+                                srgb_byte_to_linear(cell.bg.g) as f32,
+                                srgb_byte_to_linear(cell.bg.b) as f32,
+                                1.0,
+                            ],
+                        });
+                    }
 
-            let mut buffer = Buffer::new(&mut self.font_system, metrics);
-            {
-                let mut bw = buffer.borrow_with(&mut self.font_system);
-                bw.set_size(
-                    Some(pane.rect.width as f32),
-                    Some(pane.rect.height as f32),
-                );
-                bw.set_wrap(Wrap::None);
-                bw.lines.clear();
-                for (line_text, line_attrs) in split_lines_with_attrs(&text, &attrs_list) {
-                    bw.lines.push(cosmic_text::BufferLine::new(
-                        line_text,
-                        cosmic_text::LineEnding::None,
-                        line_attrs,
-                        Shaping::Basic,
-                    ));
+                    if cell.c == ' ' || cell.c == '\0' {
+                        continue;
+                    }
+
+                    let mut attrs = Attrs::new()
+                        .family(Family::Name(&font_family))
+                        .color(CTColor::rgb(cell.fg.r, cell.fg.g, cell.fg.b));
+                    if cell.bold {
+                        attrs = attrs.weight(Weight::BOLD);
+                    }
+                    if cell.italic {
+                        attrs = attrs.style(Style::Italic);
+                    }
+                    let text = cell.c.to_string();
+                    let mut buffer = Buffer::new(&mut self.font_system, metrics);
+                    {
+                        let mut bw = buffer.borrow_with(&mut self.font_system);
+                        bw.set_size(Some(buf_w), Some(ch));
+                        bw.set_wrap(Wrap::None);
+                        bw.set_text(&text, &attrs, Shaping::Advanced, None);
+                        bw.shape_until_scroll(false);
+                    }
+                    cell_buffers.push(CellBuf {
+                        buffer,
+                        x,
+                        y,
+                        pane_idx: pi,
+                    });
                 }
-                bw.shape_until_scroll(false);
             }
-            pane_buffers.push(buffer);
         }
 
         // Build per-pane IME preedit Buffer for the focused pane (at most
@@ -319,7 +337,7 @@ impl Renderer for GpuBackend {
                 let mut bw = buffer.borrow_with(&mut self.font_system);
                 bw.set_size(Some(est_w), Some(cell_h));
                 bw.set_wrap(Wrap::None);
-                bw.set_text(preedit, &attrs, Shaping::Basic, None);
+                bw.set_text(preedit, &attrs, Shaping::Advanced, None);
                 bw.shape_until_scroll(false);
             }
             ime_overlay = Some((buffer, cx, cy, est_w, cell_h));
@@ -355,30 +373,32 @@ impl Renderer for GpuBackend {
                 let mut bw = buffer.borrow_with(&mut self.font_system);
                 bw.set_size(Some(text_w), Some(bar_h as f32));
                 bw.set_wrap(Wrap::None);
-                bw.set_text(label.title, &attrs, Shaping::Basic, None);
+                bw.set_text(label.title, &attrs, Shaping::Advanced, None);
                 bw.shape_until_scroll(false);
             }
             tab_buffers.push((buffer, text_left, text_right));
         }
 
-        // Build TextAreas: panes first, then tab titles.  Both share one
-        // prepare/render call.
-        let mut text_areas: Vec<TextArea> = pane_buffers
+        // Build TextAreas: per-cell buffers first, then tab titles.  All
+        // share one prepare/render call.
+        let mut text_areas: Vec<TextArea> = cell_buffers
             .iter()
-            .zip(panes.iter())
-            .map(|(buffer, pane)| TextArea {
-                buffer,
-                left: pane.rect.x as f32,
-                top: pane.rect.y as f32,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: pane.rect.x as i32,
-                    top: pane.rect.y as i32,
-                    right: (pane.rect.x + pane.rect.width) as i32,
-                    bottom: (pane.rect.y + pane.rect.height) as i32,
-                },
-                default_color: Color::rgb(DEFAULT_FG_R, DEFAULT_FG_G, DEFAULT_FG_B),
-                custom_glyphs: &[],
+            .map(|cb| {
+                let pane = &panes[cb.pane_idx];
+                TextArea {
+                    buffer: &cb.buffer,
+                    left: cb.x,
+                    top: cb.y,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: pane.rect.x as i32,
+                        top: pane.rect.y as i32,
+                        right: (pane.rect.x + pane.rect.width) as i32,
+                        bottom: (pane.rect.y + pane.rect.height) as i32,
+                    },
+                    default_color: Color::rgb(DEFAULT_FG_R, DEFAULT_FG_G, DEFAULT_FG_B),
+                    custom_glyphs: &[],
+                }
             })
             .collect();
         for (buffer, text_left, text_right) in &tab_buffers {
@@ -486,6 +506,11 @@ impl Renderer for GpuBackend {
             }
         }
 
+        // Cell backgrounds (drawn before text, borders, highlights).
+        for bg in &cell_bgs {
+            push_rect(&mut rect_verts, bg.x, bg.y, bg.w, bg.h, bg.color, width, height);
+        }
+
         // Pane borders + search highlights + cursor outlines.
         for pane in panes {
             let r = &pane.rect;
@@ -504,6 +529,22 @@ impl Renderer for GpuBackend {
                     hw,
                     self.cell_height as i32,
                     HL_LINEAR,
+                    width,
+                    height,
+                );
+            }
+
+            for h in pane.selection_highlights {
+                let hx = r.x as i32 + h.col as i32 * self.cell_width as i32;
+                let hy = r.y as i32 + h.row as i32 * self.cell_height as i32;
+                let hw = h.len as i32 * self.cell_width as i32;
+                push_rect(
+                    &mut rect_verts,
+                    hx,
+                    hy,
+                    hw,
+                    self.cell_height as i32,
+                    SEL_LINEAR,
                     width,
                     height,
                 );
@@ -671,43 +712,3 @@ impl Renderer for GpuBackend {
     }
 }
 
-/// Split aggregated text + AttrsList into per-line (String, AttrsList) pairs
-/// at '\n' boundaries.  Each output line owns its own AttrsList sliced from
-/// the input.  Used because cosmic_text::Buffer::lines wants one BufferLine
-/// per terminal row.
-fn split_lines_with_attrs(
-    text: &str,
-    attrs: &AttrsList,
-) -> Vec<(String, AttrsList)> {
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    for (idx, ch) in text.char_indices() {
-        if ch == '\n' {
-            let end = idx;
-            let line_text = text[start..end].to_string();
-            let line_attrs = slice_attrs(attrs, start, end);
-            out.push((line_text, line_attrs));
-            start = idx + 1;
-        }
-    }
-    if start < text.len() {
-        let line_text = text[start..].to_string();
-        let line_attrs = slice_attrs(attrs, start, text.len());
-        out.push((line_text, line_attrs));
-    }
-    out
-}
-
-fn slice_attrs(src: &AttrsList, start: usize, end: usize) -> AttrsList {
-    let defaults = src.defaults();
-    let mut out = AttrsList::new(&defaults);
-    for (range, attrs_owned) in src.spans_iter() {
-        let s = range.start.max(start);
-        let e = range.end.min(end);
-        if s < e {
-            let attrs = attrs_owned.as_attrs();
-            out.add_span((s - start)..(e - start), &attrs);
-        }
-    }
-    out
-}

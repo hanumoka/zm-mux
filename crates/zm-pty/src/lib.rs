@@ -16,7 +16,17 @@ pub struct ZmPtyProcess {
 /// POSIX hosts.
 pub fn spawn_pty(rows: u16, cols: u16, shell: &ShellConfig) -> ZmResult<ZmPtyProcess> {
     let cmd = if shell.program.is_empty() {
-        CommandBuilder::new_default_prog()
+        #[cfg(windows)]
+        {
+            let mut c = CommandBuilder::new("cmd.exe");
+            c.arg("/K");
+            c.arg("chcp 65001>nul");
+            c
+        }
+        #[cfg(not(windows))]
+        {
+            CommandBuilder::new_default_prog()
+        }
     } else {
         let mut c = CommandBuilder::new(&shell.program);
         for arg in &shell.args {
@@ -107,6 +117,9 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    // Uses bare cmd.exe without chcp 65001 — tests only check basic
+    // PTY I/O, not UTF-8 encoding. Production spawn_pty with empty
+    // ShellConfig uses cmd.exe /K chcp 65001>nul on Windows.
     fn test_shell() -> ShellConfig {
         #[cfg(windows)]
         let program = "cmd.exe".to_string();

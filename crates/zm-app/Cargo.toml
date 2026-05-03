@@ -15,3 +15,4 @@ zm-agent = { workspace = true }
 zm-socket = { workspace = true }
 winit = { workspace = true }
 notify-rust = "4"
+arboard = { workspace = true }
