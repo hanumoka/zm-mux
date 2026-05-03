@@ -5,5 +5,6 @@
 // Phase 2.2 — Socket API (zm-mux self-coordination on the same transport)
 // Phase 3.3 — MCP server (rmcp)
 
+pub mod mux_api;
 pub mod rpc;
 pub mod transport_sync;

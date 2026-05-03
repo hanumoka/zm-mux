@@ -38,6 +38,8 @@ use interprocess::local_socket::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::mux_api::types::MuxMethod;
+use crate::mux_api::{MuxHandler, dispatch_mux};
 use crate::rpc::{BackendHandler, Notification, Request, Response, dispatch};
 
 /// Server-side framing + dispatch over a local socket.
@@ -165,6 +167,102 @@ fn write_message<T: Serialize, W: Write>(writer: &mut W, msg: &T) -> std::io::Re
     writer.write_all(&bytes)?;
     writer.flush()?;
     Ok(())
+}
+
+// ---- MuxServer (Phase 2.2) --------------------------------------------------
+
+/// Server for the `mux.*` protocol. Same NDJSON framing as
+/// [`BackendServer`], but dispatches to a [`MuxHandler`] implementation.
+/// No notifications in the mux protocol (read-only for now).
+pub struct MuxServer<M: MuxHandler + Send + Sync + 'static> {
+    handler: Arc<M>,
+    socket_name: String,
+}
+
+impl<M: MuxHandler + Send + Sync + 'static> MuxServer<M> {
+    pub fn new(handler: Arc<M>, socket_name: impl Into<String>) -> Self {
+        Self {
+            handler,
+            socket_name: socket_name.into(),
+        }
+    }
+
+    pub fn socket_name(&self) -> &str {
+        &self.socket_name
+    }
+
+    pub fn serve_forever(&self) -> std::io::Result<()> {
+        let listener = self.bind()?;
+        loop {
+            match listener.accept() {
+                Ok(stream) => {
+                    if let Err(e) = handle_mux_connection(stream, &self.handler) {
+                        eprintln!("zm-socket(mux): connection ended with error: {e}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("zm-socket(mux): accept failed: {e}");
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    fn bind(&self) -> std::io::Result<interprocess::local_socket::Listener> {
+        let name = self
+            .socket_name
+            .as_str()
+            .to_ns_name::<GenericNamespaced>()?;
+        ListenerOptions::new().name(name).create_sync()
+    }
+}
+
+fn handle_mux_connection<M: MuxHandler>(
+    stream: Stream,
+    handler: &Arc<M>,
+) -> std::io::Result<()> {
+    let writer_half = stream;
+    let reader_half = writer_half.try_clone()?;
+    let mut reader = BufReader::new(reader_half);
+    let mut writer = writer_half;
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        }
+
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let request: Request = match serde_json::from_str(trimmed) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("zm-socket(mux): parse error: {e}; ignored");
+                continue;
+            }
+        };
+
+        let response = if MuxMethod::is_mux_method(&request.method) {
+            dispatch_mux(&**handler, request)
+        } else {
+            use crate::rpc::{RpcError, ResponseError};
+            Response::Error(ResponseError::new(
+                request.id,
+                RpcError::new(
+                    RpcError::METHOD_NOT_FOUND,
+                    format!("mux server does not handle: {}", request.method),
+                ),
+            ))
+        };
+
+        write_message(&mut writer, &response)?;
+    }
 }
 
 // ---- Client side ------------------------------------------------------------

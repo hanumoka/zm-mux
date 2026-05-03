@@ -21,8 +21,6 @@ const DEFAULT_FG_B: u8 = 0xCC;
 
 // Cursor outline + pane border colors (sRGB; converted to linear at draw time).
 const CURSOR_SRGB: (u8, u8, u8) = (0xCC, 0xCC, 0xCC);
-const BORDER_FOCUSED_SRGB: (u8, u8, u8) = (0x44, 0x88, 0xFF);
-const BORDER_UNFOCUSED_SRGB: (u8, u8, u8) = (0x44, 0x44, 0x44);
 
 // Tab bar palette (sRGB).
 const TAB_BAR_BG_SRGB: (u8, u8, u8) = (0x0F, 0x0F, 0x1A);
@@ -448,8 +446,6 @@ impl Renderer for GpuBackend {
 
         // Linear color cache (sRGB → linear once).
         let cursor_color = srgb_triplet_to_linear(CURSOR_SRGB);
-        let border_focused = srgb_triplet_to_linear(BORDER_FOCUSED_SRGB);
-        let border_unfocused = srgb_triplet_to_linear(BORDER_UNFOCUSED_SRGB);
         let tab_bar_bg = srgb_triplet_to_linear(TAB_BAR_BG_SRGB);
         let tab_active_bg = srgb_triplet_to_linear(TAB_ACTIVE_SRGB);
         let tab_inactive_bg = srgb_triplet_to_linear(TAB_INACTIVE_SRGB);
@@ -550,11 +546,7 @@ impl Renderer for GpuBackend {
                 );
             }
 
-            let border = if pane.focused {
-                border_focused
-            } else {
-                border_unfocused
-            };
+            let border = srgb_triplet_to_linear(pane.border_color_srgb);
             push_rect(
                 &mut rect_verts,
                 r.x as i32,

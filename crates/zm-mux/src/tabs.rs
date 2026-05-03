@@ -153,6 +153,31 @@ impl TabSet {
             false
         }
     }
+
+    pub fn tab_containing_pane_mut(&mut self, pane_id: PaneId) -> Option<&mut Tab> {
+        self.tabs
+            .iter_mut()
+            .find(|tab| tab.tree.pane_ids().contains(&pane_id))
+    }
+
+    /// Close a specific tab by ID.  Returns the PaneIds that lived in
+    /// it so the caller can kill their PTYs.  No-op (returns empty Vec)
+    /// when only one tab remains or the tab is not found.
+    pub fn close_by_id(&mut self, target: TabId) -> Vec<PaneId> {
+        if self.tabs.len() <= 1 {
+            return Vec::new();
+        }
+        let idx = match self.tabs.iter().position(|t| t.id == target) {
+            Some(i) => i,
+            None => return Vec::new(),
+        };
+        let removed = self.tabs.remove(idx);
+        if self.active == target {
+            let new_idx = idx.min(self.tabs.len() - 1);
+            self.active = self.tabs[new_idx].id;
+        }
+        removed.tree.pane_ids()
+    }
 }
 
 #[cfg(test)]
@@ -250,5 +275,53 @@ mod tests {
     fn switch_unknown_tab_returns_false() {
         let (mut set, _) = TabSet::new();
         assert!(!set.switch_to(TabId(99)));
+    }
+
+    #[test]
+    fn tab_containing_pane_finds_correct_tab() {
+        let (mut set, initial) = TabSet::new();
+        let (_, second_pane) = set.create_tab();
+        let tab = set.tab_containing_pane_mut(initial);
+        assert!(tab.is_some());
+        assert_eq!(tab.unwrap().id, TabId(0));
+
+        let tab = set.tab_containing_pane_mut(second_pane);
+        assert!(tab.is_some());
+        assert_eq!(tab.unwrap().id, TabId(1));
+
+        assert!(set.tab_containing_pane_mut(PaneId(999)).is_none());
+    }
+
+    #[test]
+    fn close_by_id_removes_tab() {
+        let (mut set, _) = TabSet::new();
+        let (t1, p1) = set.create_tab();
+        let new_pane_id = set.alloc_pane_id();
+        let focused = set.active().focused_pane;
+        set.active_mut()
+            .tree
+            .split(focused, SplitDirection::Horizontal, new_pane_id);
+
+        let killed = set.close_by_id(t1);
+        assert_eq!(killed.len(), 2);
+        assert!(killed.contains(&p1));
+        assert!(killed.contains(&new_pane_id));
+        assert_eq!(set.tab_count(), 1);
+        assert_eq!(set.active_id(), TabId(0));
+    }
+
+    #[test]
+    fn close_by_id_noop_for_last_tab() {
+        let (mut set, _) = TabSet::new();
+        assert!(set.close_by_id(TabId(0)).is_empty());
+        assert_eq!(set.tab_count(), 1);
+    }
+
+    #[test]
+    fn close_by_id_unknown_tab() {
+        let (mut set, _) = TabSet::new();
+        let _ = set.create_tab();
+        assert!(set.close_by_id(TabId(99)).is_empty());
+        assert_eq!(set.tab_count(), 2);
     }
 }

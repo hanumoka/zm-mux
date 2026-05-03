@@ -14,8 +14,13 @@ pub struct ZmPtyProcess {
 /// `program` falls back to `portable_pty::CommandBuilder::new_default_prog`
 /// which picks `cmd.exe` on Windows and `$SHELL` (or `/bin/sh`) on
 /// POSIX hosts.
-pub fn spawn_pty(rows: u16, cols: u16, shell: &ShellConfig) -> ZmResult<ZmPtyProcess> {
-    let cmd = if shell.program.is_empty() {
+pub fn spawn_pty(
+    rows: u16,
+    cols: u16,
+    shell: &ShellConfig,
+    env_vars: &[(&str, &str)],
+) -> ZmResult<ZmPtyProcess> {
+    let mut cmd = if shell.program.is_empty() {
         #[cfg(windows)]
         {
             let mut c = CommandBuilder::new("cmd.exe");
@@ -34,6 +39,9 @@ pub fn spawn_pty(rows: u16, cols: u16, shell: &ShellConfig) -> ZmResult<ZmPtyPro
         }
         c
     };
+    for &(k, v) in env_vars {
+        cmd.env(k, v);
+    }
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -70,7 +78,7 @@ pub fn spawn_pty(rows: u16, cols: u16, shell: &ShellConfig) -> ZmResult<ZmPtyPro
 }
 
 pub fn spawn_default_shell(rows: u16, cols: u16) -> ZmResult<ZmPtyProcess> {
-    spawn_pty(rows, cols, &ShellConfig::default())
+    spawn_pty(rows, cols, &ShellConfig::default(), &[])
 }
 
 impl ZmPtyProcess {
@@ -134,7 +142,7 @@ mod tests {
     #[test]
     fn pty_spawn_and_read() {
         let shell = test_shell();
-        let mut proc = spawn_pty(24, 80, &shell).expect("spawn should succeed");
+        let mut proc = spawn_pty(24, 80, &shell, &[]).expect("spawn should succeed");
         let reader = proc.take_reader().expect("reader");
 
         let (tx, rx) = mpsc::channel();
@@ -165,7 +173,7 @@ mod tests {
     #[test]
     fn pty_write_does_not_error() {
         let shell = test_shell();
-        let mut proc = spawn_pty(24, 80, &shell).expect("spawn");
+        let mut proc = spawn_pty(24, 80, &shell, &[]).expect("spawn");
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         let result = proc.write_input(b"echo test\r\n");
@@ -177,7 +185,7 @@ mod tests {
     #[test]
     fn pty_kill() {
         let shell = test_shell();
-        let mut proc = spawn_pty(24, 80, &shell).expect("spawn");
+        let mut proc = spawn_pty(24, 80, &shell, &[]).expect("spawn");
         assert!(
             proc.try_wait().unwrap().is_none(),
             "process should be running"

@@ -7,3 +7,7 @@ description = "AI agent detection, tmux compat, and agent lifecycle"
 
 [dependencies]
 zm-core = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

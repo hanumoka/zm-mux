@@ -15,12 +15,21 @@ use selection::{CellCoord, SelectionState};
 use zm_core::{
     Config, KeyBindingsConfig, KeyDef, ModBits, ParsedKeyBindings, ShellConfig,
 };
-use zm_mux::{BorderHit, PaneId, SplitDirection, TabSet};
+use zm_agent::{AgentInfo, AgentStatus, AgentType};
+use zm_mux::{BorderHit, PaneId, SplitDirection, TabId, TabSet};
 use zm_pty::ZmPtyProcess;
 use zm_render::{
     HighlightCell, PaneRenderInfo, Rect, Renderer, TAB_BAR_HEIGHT_PX, TabBarInfo, TabLabel,
     create_renderer,
 };
+use zm_socket::mux_api::MuxHandler;
+use zm_socket::mux_api::types::{
+    ClosePaneParams, ClosePaneResult, CloseTabParams, CloseTabResult, CreateTabParams,
+    CreateTabResult, FocusPaneParams, FocusPaneResult, GetStatusParams, GetStatusResult,
+    ListPanesParams, ListPanesResult, MuxMethod, PaneInfo, SendKeysParams, SendKeysResult,
+    SetAgentInfoParams, SetAgentInfoResult, SplitPaneParams, SplitPaneResult, PANE_NOT_FOUND,
+};
+use zm_socket::rpc::RpcError;
 use zm_term::{CellColor, OscEvent, ZmTerm};
 
 use crate::notify::NotifyDispatcher;
@@ -31,6 +40,7 @@ const INITIAL_ROWS: u16 = 24;
 struct PaneState {
     term: ZmTerm,
     pty: ZmPtyProcess,
+    agent_info: AgentInfo,
 }
 
 struct MuxState {
@@ -41,6 +51,12 @@ struct MuxState {
     scrollback_lines: usize,
     default_fg: CellColor,
     default_bg: CellColor,
+    cell_width: usize,
+    cell_height: usize,
+    pane_area_width: usize,
+    pane_area_height: usize,
+    workspace_id: String,
+    socket_name: String,
 }
 
 impl MuxState {
@@ -49,9 +65,13 @@ impl MuxState {
         scrollback_lines: usize,
         default_fg: CellColor,
         default_bg: CellColor,
+        workspace_id: String,
+        socket_name: String,
     ) -> Self {
         let (tabs, initial_pane) = TabSet::new();
         let mut panes = HashMap::new();
+        let env_vars = Self::pane_env_vars_owned(&workspace_id, initial_pane, &socket_name);
+        let env_refs: Vec<(&str, &str)> = env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let pane = make_pane(
             INITIAL_COLS,
             INITIAL_ROWS,
@@ -59,6 +79,7 @@ impl MuxState {
             scrollback_lines,
             default_fg,
             default_bg,
+            &env_refs,
         );
         panes.insert(initial_pane, pane);
 
@@ -70,10 +91,26 @@ impl MuxState {
             scrollback_lines,
             default_fg,
             default_bg,
+            cell_width: 0,
+            cell_height: 0,
+            pane_area_width: 0,
+            pane_area_height: 0,
+            workspace_id,
+            socket_name,
         }
     }
 
-    fn make_pane(&self, cols: u16, rows: u16) -> PaneState {
+    fn pane_env_vars_owned(workspace_id: &str, pane_id: PaneId, socket_name: &str) -> Vec<(String, String)> {
+        vec![
+            ("ZM_MUX_WORKSPACE_ID".into(), workspace_id.into()),
+            ("ZM_MUX_SURFACE_ID".into(), pane_id.0.to_string()),
+            ("ZM_MUX_SOCKET_PATH".into(), socket_name.into()),
+        ]
+    }
+
+    fn make_pane(&self, cols: u16, rows: u16, pane_id: PaneId) -> PaneState {
+        let env_vars = Self::pane_env_vars_owned(&self.workspace_id, pane_id, &self.socket_name);
+        let env_refs: Vec<(&str, &str)> = env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         make_pane(
             cols,
             rows,
@@ -81,6 +118,7 @@ impl MuxState {
             self.scrollback_lines,
             self.default_fg,
             self.default_bg,
+            &env_refs,
         )
     }
 
@@ -114,7 +152,7 @@ impl MuxState {
         let layout = layout.unwrap();
         if let Some((_, rect)) = layout.iter().find(|(id, _)| *id == new_id) {
             let (cols, rows) = renderer.cols_rows_for_size(rect.width, rect.height);
-            let pane = self.make_pane(cols, rows);
+            let pane = self.make_pane(cols, rows, new_id);
             self.panes.insert(new_id, pane);
             self.resize_all_panes(renderer, win_width, win_height);
             self.dirty = true;
@@ -168,7 +206,7 @@ impl MuxState {
     ) -> PaneId {
         let (_tab_id, initial_pane) = self.tabs.create_tab();
         let (cols, rows) = renderer.cols_rows_for_size(win_width, win_height);
-        let pane = self.make_pane(cols, rows);
+        let pane = self.make_pane(cols, rows, initial_pane);
         self.panes.insert(initial_pane, pane);
         self.dirty = true;
         initial_pane
@@ -209,6 +247,117 @@ impl MuxState {
             }
         }
     }
+
+    fn cached_cols_rows(&self, width: usize, height: usize) -> (u16, u16) {
+        if self.cell_width == 0 || self.cell_height == 0 {
+            return (INITIAL_COLS, INITIAL_ROWS);
+        }
+        let avail_h = height.saturating_sub(TAB_BAR_HEIGHT_PX as usize);
+        (
+            (width / self.cell_width).max(1) as u16,
+            (avail_h / self.cell_height).max(1) as u16,
+        )
+    }
+
+    fn resize_all_panes_cached(&mut self) {
+        let cw = self.cell_width;
+        let ch = self.cell_height;
+        if cw == 0 || ch == 0 {
+            return;
+        }
+        let w = self.pane_area_width;
+        let h = self.pane_area_height;
+        let all_layouts: Vec<(PaneId, zm_mux::Rect)> = self
+            .tabs
+            .tabs()
+            .iter()
+            .flat_map(|tab| tab.tree.layout(w, h))
+            .collect();
+        for (id, rect) in all_layouts {
+            if let Some(ps) = self.panes.get_mut(&id) {
+                let avail_h = rect.height.saturating_sub(TAB_BAR_HEIGHT_PX as usize);
+                let cols = (rect.width / cw).max(1) as u16;
+                let rows = (avail_h / ch).max(1) as u16;
+                if cols > 0 && rows > 0 {
+                    ps.term.resize(cols, rows);
+                    ps.pty.resize(rows, cols).ok();
+                }
+            }
+        }
+    }
+
+    fn split_pane_by_id(
+        &mut self,
+        target: PaneId,
+        direction: SplitDirection,
+    ) -> Option<PaneId> {
+        let new_id = self.tabs.alloc_pane_id();
+        let tab = self.tabs.tab_containing_pane_mut(target)?;
+        if !tab.tree.split(target, direction, new_id) {
+            return None;
+        }
+        let w = self.pane_area_width;
+        let h = self.pane_area_height;
+        let layout = tab.tree.layout(w, h);
+        let (_, rect) = layout.iter().find(|(id, _)| *id == new_id)?;
+        let (cols, rows) = self.cached_cols_rows(rect.width, rect.height);
+        let pane = self.make_pane(cols, rows, new_id);
+        self.panes.insert(new_id, pane);
+        self.resize_all_panes_cached();
+        self.dirty = true;
+        Some(new_id)
+    }
+
+    fn close_pane_by_id(&mut self, target: PaneId) -> bool {
+        let tab = match self.tabs.tab_containing_pane_mut(target) {
+            Some(t) => t,
+            None => return false,
+        };
+        if tab.tree.pane_count() <= 1 {
+            return false;
+        }
+        if tab.focused_pane == target {
+            let ids = tab.tree.pane_ids();
+            tab.focused_pane = ids
+                .iter()
+                .find(|id| **id != target)
+                .copied()
+                .unwrap_or(target);
+        }
+        if !tab.tree.remove(target) {
+            return false;
+        }
+        if let Some(mut ps) = self.panes.remove(&target) {
+            ps.pty.kill().ok();
+        }
+        self.dirty = true;
+        true
+    }
+
+    fn create_tab_cached(&mut self) -> (zm_mux::TabId, PaneId) {
+        let (tab_id, initial_pane) = self.tabs.create_tab();
+        let w = self.pane_area_width;
+        let h = self.pane_area_height;
+        let (cols, rows) = self.cached_cols_rows(w, h);
+        let pane = self.make_pane(cols, rows, initial_pane);
+        self.panes.insert(initial_pane, pane);
+        self.dirty = true;
+        (tab_id, initial_pane)
+    }
+
+    fn close_tab_by_id(&mut self, target: zm_mux::TabId) -> bool {
+        let removed = self.tabs.close_by_id(target);
+        if removed.is_empty() {
+            return false;
+        }
+        for id in removed {
+            if let Some(mut ps) = self.panes.remove(&id) {
+                ps.pty.kill().ok();
+            }
+        }
+        self.dirty = true;
+        true
+    }
 }
 
 fn make_pane(
@@ -218,11 +367,12 @@ fn make_pane(
     scrollback_lines: usize,
     default_fg: CellColor,
     default_bg: CellColor,
+    env_vars: &[(&str, &str)],
 ) -> PaneState {
-    let pty = zm_pty::spawn_pty(rows, cols, shell_cfg).expect("PTY spawn");
+    let pty = zm_pty::spawn_pty(rows, cols, shell_cfg, env_vars).expect("PTY spawn");
     let term = ZmTerm::new(cols, rows, scrollback_lines, default_fg, default_bg)
         .expect("term init");
-    PaneState { term, pty }
+    PaneState { term, pty, agent_info: AgentInfo::default() }
 }
 
 fn start_reader(pane_id: PaneId, state: &Arc<Mutex<MuxState>>) {
@@ -256,8 +406,182 @@ fn start_reader(pane_id: PaneId, state: &Arc<Mutex<MuxState>>) {
                     Err(_) => break,
                 }
             }
+            let mut s = state_clone.lock().unwrap();
+            if let Some(ps) = s.panes.get_mut(&pane_id) {
+                if ps.agent_info.agent_type != AgentType::Unknown {
+                    ps.agent_info.status = AgentStatus::Complete;
+                    s.dirty = true;
+                }
+            }
         });
     }
+}
+
+// ---- Socket API handler (Phase 2.2) ----------------------------------------
+
+struct AppMuxHandler {
+    state: Arc<Mutex<MuxState>>,
+    socket_name: String,
+}
+
+impl MuxHandler for AppMuxHandler {
+    fn handle_list_panes(&self, _params: ListPanesParams) -> Result<ListPanesResult, RpcError> {
+        let state = self.state.lock().expect("MuxState lock");
+        let mut panes = Vec::new();
+        for tab in state.tabs.tabs() {
+            let focused = tab.focused_pane;
+            for pane_id in tab.tree.pane_ids() {
+                let ps = state.panes.get(&pane_id);
+                let (cols, rows) = ps
+                    .map(|p| (p.term.cols() as u16, p.term.rows() as u16))
+                    .unwrap_or((0, 0));
+                let (at, as_) = ps
+                    .map(|p| (p.agent_info.agent_type.as_str(), p.agent_info.status.as_str()))
+                    .unwrap_or(("unknown", "unknown"));
+                panes.push(PaneInfo {
+                    pane_id: pane_id.0,
+                    tab_id: tab.id.0,
+                    focused: pane_id == focused && tab.id == state.tabs.active_id(),
+                    cols,
+                    rows,
+                    title: tab.title.clone().unwrap_or_default(),
+                    agent_type: at.to_string(),
+                    agent_status: as_.to_string(),
+                });
+            }
+        }
+        Ok(ListPanesResult { panes })
+    }
+
+    fn handle_get_status(&self, _params: GetStatusParams) -> Result<GetStatusResult, RpcError> {
+        let state = self.state.lock().expect("MuxState lock");
+        Ok(GetStatusResult {
+            workspace_id: state.workspace_id.clone(),
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            active_tab: state.tabs.active_id().0,
+            pane_count: state.panes.len(),
+            tab_count: state.tabs.tab_count(),
+            socket_path: self.socket_name.clone(),
+        })
+    }
+
+    fn handle_send_keys(&self, params: SendKeysParams) -> Result<SendKeysResult, RpcError> {
+        let mut state = self.state.lock().expect("MuxState lock");
+        let target = PaneId(params.pane_id);
+        let ps = state.panes.get_mut(&target).ok_or_else(|| {
+            RpcError::new(PANE_NOT_FOUND, format!("pane {} not found", params.pane_id))
+        })?;
+        ps.pty
+            .write_input(params.data.as_bytes())
+            .map_err(|e| RpcError::new(RpcError::INTERNAL_ERROR, e.to_string()))?;
+        state.dirty = true;
+        Ok(SendKeysResult {})
+    }
+
+    fn handle_focus_pane(&self, params: FocusPaneParams) -> Result<FocusPaneResult, RpcError> {
+        let mut state = self.state.lock().expect("MuxState lock");
+        let target = PaneId(params.pane_id);
+        if !state.panes.contains_key(&target) {
+            return Err(RpcError::new(PANE_NOT_FOUND, format!("pane {} not found", params.pane_id)));
+        }
+        let tab = state.tabs.tabs().iter().find(|t| t.tree.pane_ids().contains(&target));
+        let tab_id = match tab {
+            Some(t) => t.id,
+            None => return Err(RpcError::new(PANE_NOT_FOUND, "pane not in any tab")),
+        };
+        state.tabs.switch_to(tab_id);
+        state.tabs.active_mut().focused_pane = target;
+        state.dirty = true;
+        Ok(FocusPaneResult {})
+    }
+
+    fn handle_split_pane(&self, params: SplitPaneParams) -> Result<SplitPaneResult, RpcError> {
+        use zm_socket::mux_api::types::SPLIT_FAILED;
+        let direction = match params.direction.as_str() {
+            "horizontal" => SplitDirection::Horizontal,
+            "vertical" => SplitDirection::Vertical,
+            _ => return Err(RpcError::new(
+                RpcError::INVALID_PARAMS,
+                "direction must be \"horizontal\" or \"vertical\"",
+            )),
+        };
+        let new_id = {
+            let mut state = self.state.lock().expect("MuxState lock");
+            state
+                .split_pane_by_id(PaneId(params.pane_id), direction)
+                .ok_or_else(|| RpcError::new(SPLIT_FAILED, "split failed"))?
+        };
+        start_reader(new_id, &self.state);
+        Ok(SplitPaneResult { new_pane_id: new_id.0 })
+    }
+
+    fn handle_close_pane(&self, params: ClosePaneParams) -> Result<ClosePaneResult, RpcError> {
+        use zm_socket::mux_api::types::CANNOT_CLOSE_LAST_PANE;
+        let mut state = self.state.lock().expect("MuxState lock");
+        if !state.panes.contains_key(&PaneId(params.pane_id)) {
+            return Err(RpcError::new(PANE_NOT_FOUND, format!("pane {} not found", params.pane_id)));
+        }
+        if !state.close_pane_by_id(PaneId(params.pane_id)) {
+            return Err(RpcError::new(CANNOT_CLOSE_LAST_PANE, "cannot close the last pane in a tab"));
+        }
+        Ok(ClosePaneResult {})
+    }
+
+    fn handle_create_tab(&self, _params: CreateTabParams) -> Result<CreateTabResult, RpcError> {
+        let (tab_id, pane_id) = {
+            let mut state = self.state.lock().expect("MuxState lock");
+            state.create_tab_cached()
+        };
+        start_reader(pane_id, &self.state);
+        Ok(CreateTabResult { tab_id: tab_id.0, pane_id: pane_id.0 })
+    }
+
+    fn handle_close_tab(&self, params: CloseTabParams) -> Result<CloseTabResult, RpcError> {
+        use zm_socket::mux_api::types::{TAB_NOT_FOUND, CANNOT_CLOSE_LAST_TAB};
+        let mut state = self.state.lock().expect("MuxState lock");
+        let target = TabId(params.tab_id);
+        if !state.tabs.tabs().iter().any(|t| t.id == target) {
+            return Err(RpcError::new(TAB_NOT_FOUND, format!("tab {} not found", params.tab_id)));
+        }
+        if !state.close_tab_by_id(target) {
+            return Err(RpcError::new(CANNOT_CLOSE_LAST_TAB, "cannot close the last tab"));
+        }
+        Ok(CloseTabResult {})
+    }
+
+    fn handle_set_agent_info(&self, params: SetAgentInfoParams) -> Result<SetAgentInfoResult, RpcError> {
+        let mut state = self.state.lock().expect("MuxState lock");
+        let target = PaneId(params.pane_id);
+        let ps = state.panes.get_mut(&target).ok_or_else(|| {
+            RpcError::new(PANE_NOT_FOUND, format!("pane {} not found", params.pane_id))
+        })?;
+        if let Some(t) = &params.agent_type {
+            ps.agent_info.agent_type = AgentType::parse(t);
+        }
+        if let Some(s) = &params.agent_status {
+            ps.agent_info.status = AgentStatus::parse(s);
+        }
+        state.dirty = true;
+        Ok(SetAgentInfoResult {})
+    }
+}
+
+fn socket_name_for_pid() -> String {
+    format!("zm-mux-{}", std::process::id())
+}
+
+fn start_socket_server(state: Arc<Mutex<MuxState>>, socket_name: String) {
+    let handler = Arc::new(AppMuxHandler {
+        state,
+        socket_name: socket_name.clone(),
+    });
+    let server = zm_socket::transport_sync::MuxServer::new(handler, &socket_name);
+    std::thread::spawn(move || {
+        if let Err(e) = server.serve_forever() {
+            eprintln!("zm-mux: socket server error: {e}");
+        }
+    });
 }
 
 /// Convert winit modifier flags into zm-core's backend-agnostic ModBits so
@@ -484,22 +808,26 @@ impl App {
         let pane_infos: Vec<PaneRenderInfo> = layouts
             .iter()
             .filter_map(|(id, mux_rect)| {
-                state.panes.get(id).map(|ps| PaneRenderInfo {
-                    term: &ps.term,
-                    rect: Rect {
-                        x: mux_rect.x,
-                        y: mux_rect.y + TAB_BAR_HEIGHT_PX as usize,
-                        width: mux_rect.width,
-                        height: mux_rect.height,
-                    },
-                    focused: *id == focused,
-                    ime_preedit: if *id == focused { preedit_str } else { None },
-                    highlights: if *id == focused { active_highlights } else { &[] },
-                    selection_highlights: if Some(*id) == sel_pane {
-                        &sel_highlights
-                    } else {
-                        &[]
-                    },
+                state.panes.get(id).map(|ps| {
+                    let is_focused = *id == focused;
+                    PaneRenderInfo {
+                        term: &ps.term,
+                        rect: Rect {
+                            x: mux_rect.x,
+                            y: mux_rect.y + TAB_BAR_HEIGHT_PX as usize,
+                            width: mux_rect.width,
+                            height: mux_rect.height,
+                        },
+                        focused: is_focused,
+                        ime_preedit: if is_focused { preedit_str } else { None },
+                        highlights: if is_focused { active_highlights } else { &[] },
+                        selection_highlights: if Some(*id) == sel_pane {
+                            &sel_highlights
+                        } else {
+                            &[]
+                        },
+                        border_color_srgb: ps.agent_info.border_color_srgb(is_focused),
+                    }
                 })
             })
             .collect();
@@ -683,8 +1011,20 @@ impl ApplicationHandler for App {
         // event (the very first pane is born focused).
         window.set_ime_allowed(true);
 
-        self.window = Some(window);
+        self.window = Some(window.clone());
         self.renderer = Some(renderer);
+
+        {
+            let (cw, ch) = self.renderer.as_ref().unwrap().cell_size();
+            let size = window.inner_size();
+            let pa_w = size.width as usize;
+            let pa_h = (size.height as usize).saturating_sub(TAB_BAR_HEIGHT_PX as usize);
+            let mut state = self.state.lock().unwrap();
+            state.cell_width = cw;
+            state.cell_height = ch;
+            state.pane_area_width = pa_w;
+            state.pane_area_height = pa_h;
+        }
 
         let initial = self.state.lock().unwrap().tabs.active().focused_pane;
         start_reader(initial, &self.state);
@@ -1020,6 +1360,8 @@ impl ApplicationHandler for App {
                 let (w, h) = self.pane_area_size();
                 if let Some(renderer) = self.renderer_ref() {
                     let mut state = self.state.lock().unwrap();
+                    state.pane_area_width = w;
+                    state.pane_area_height = h;
                     state.resize_all_panes(renderer, w, h);
                     state.dirty = true;
                 }
@@ -1331,7 +1673,297 @@ impl ApplicationHandler for App {
     }
 }
 
+// ---- CLI client mode --------------------------------------------------------
+
+fn cli_main(args: &[String]) {
+    let subcommand = args[1].as_str();
+    let socket_name = match std::env::var("ZM_MUX_SOCKET_PATH") {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("error: ZM_MUX_SOCKET_PATH not set. Is zm-mux running?");
+            std::process::exit(1);
+        }
+    };
+
+    let mut client = match zm_socket::transport_sync::Client::connect(&socket_name) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: cannot connect to zm-mux at {socket_name}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    use zm_socket::rpc::{JSONRPC_VERSION, Request, RequestId, Response};
+
+    match subcommand {
+        "list" => {
+            let req = Request {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: RequestId::Num(1),
+                method: MuxMethod::ListPanes.as_str().to_string(),
+                params: serde_json::json!({}),
+            };
+            match client.call(&req) {
+                Ok((Response::Success(s), _)) => {
+                    let result: ListPanesResult =
+                        serde_json::from_value(s.result).expect("parse result");
+                    println!("{:<8} {:<8} {:<8} {:<6} {:<6} TITLE",
+                        "PANE_ID", "TAB_ID", "FOCUSED", "COLS", "ROWS");
+                    for p in &result.panes {
+                        println!("{:<8} {:<8} {:<8} {:<6} {:<6} {}",
+                            p.pane_id,
+                            p.tab_id,
+                            if p.focused { "*" } else { "" },
+                            p.cols,
+                            p.rows,
+                            p.title);
+                    }
+                }
+                Ok((Response::Error(e), _)) => {
+                    eprintln!("error: {} (code {})", e.error.message, e.error.code);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "status" => {
+            let req = Request {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: RequestId::Num(1),
+                method: MuxMethod::GetStatus.as_str().to_string(),
+                params: serde_json::json!({}),
+            };
+            match client.call(&req) {
+                Ok((Response::Success(s), _)) => {
+                    let result: GetStatusResult =
+                        serde_json::from_value(s.result).expect("parse result");
+                    println!("workspace:  {}", result.workspace_id);
+                    println!("pid:        {}", result.pid);
+                    println!("version:    {}", result.version);
+                    println!("active_tab: {}", result.active_tab);
+                    println!("panes:      {}", result.pane_count);
+                    println!("tabs:       {}", result.tab_count);
+                    println!("socket:     {}", result.socket_path);
+                }
+                Ok((Response::Error(e), _)) => {
+                    eprintln!("error: {} (code {})", e.error.message, e.error.code);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "send" => {
+            if args.len() < 4 {
+                eprintln!("usage: zm-mux send <pane_id> <text>");
+                std::process::exit(1);
+            }
+            let pane_id: u32 = args[2].parse().unwrap_or_else(|_| {
+                eprintln!("error: pane_id must be a number");
+                std::process::exit(1);
+            });
+            let data = args[3..].join(" ");
+            let req = Request {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: RequestId::Num(1),
+                method: MuxMethod::SendKeys.as_str().to_string(),
+                params: serde_json::to_value(SendKeysParams { pane_id, data }).unwrap(),
+            };
+            match client.call(&req) {
+                Ok((Response::Success(_), _)) => println!("ok"),
+                Ok((Response::Error(e), _)) => {
+                    eprintln!("error: {} (code {})", e.error.message, e.error.code);
+                    std::process::exit(1);
+                }
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+            }
+        }
+        "focus" => {
+            if args.len() < 3 {
+                eprintln!("usage: zm-mux focus <pane_id>");
+                std::process::exit(1);
+            }
+            let pane_id: u32 = args[2].parse().unwrap_or_else(|_| {
+                eprintln!("error: pane_id must be a number");
+                std::process::exit(1);
+            });
+            let req = Request {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: RequestId::Num(1),
+                method: MuxMethod::FocusPane.as_str().to_string(),
+                params: serde_json::to_value(FocusPaneParams { pane_id }).unwrap(),
+            };
+            match client.call(&req) {
+                Ok((Response::Success(_), _)) => println!("ok"),
+                Ok((Response::Error(e), _)) => {
+                    eprintln!("error: {} (code {})", e.error.message, e.error.code);
+                    std::process::exit(1);
+                }
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+            }
+        }
+        "split" => {
+            if args.len() < 4 {
+                eprintln!("usage: zm-mux split <pane_id> <horizontal|vertical>");
+                std::process::exit(1);
+            }
+            let pane_id: u32 = args[2].parse().unwrap_or_else(|_| {
+                eprintln!("error: pane_id must be a number");
+                std::process::exit(1);
+            });
+            let direction = args[3].clone();
+            let req = Request {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: RequestId::Num(1),
+                method: MuxMethod::SplitPane.as_str().to_string(),
+                params: serde_json::to_value(SplitPaneParams { pane_id, direction }).unwrap(),
+            };
+            match client.call(&req) {
+                Ok((Response::Success(s), _)) => {
+                    let r: SplitPaneResult = serde_json::from_value(s.result).expect("parse");
+                    println!("new_pane_id: {}", r.new_pane_id);
+                }
+                Ok((Response::Error(e), _)) => {
+                    eprintln!("error: {} (code {})", e.error.message, e.error.code);
+                    std::process::exit(1);
+                }
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+            }
+        }
+        "close-pane" => {
+            if args.len() < 3 {
+                eprintln!("usage: zm-mux close-pane <pane_id>");
+                std::process::exit(1);
+            }
+            let pane_id: u32 = args[2].parse().unwrap_or_else(|_| {
+                eprintln!("error: pane_id must be a number");
+                std::process::exit(1);
+            });
+            let req = Request {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: RequestId::Num(1),
+                method: MuxMethod::ClosePane.as_str().to_string(),
+                params: serde_json::to_value(ClosePaneParams { pane_id }).unwrap(),
+            };
+            match client.call(&req) {
+                Ok((Response::Success(_), _)) => println!("ok"),
+                Ok((Response::Error(e), _)) => {
+                    eprintln!("error: {} (code {})", e.error.message, e.error.code);
+                    std::process::exit(1);
+                }
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+            }
+        }
+        "new-tab" => {
+            let req = Request {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: RequestId::Num(1),
+                method: MuxMethod::CreateTab.as_str().to_string(),
+                params: serde_json::json!({}),
+            };
+            match client.call(&req) {
+                Ok((Response::Success(s), _)) => {
+                    let r: CreateTabResult = serde_json::from_value(s.result).expect("parse");
+                    println!("tab_id: {}, pane_id: {}", r.tab_id, r.pane_id);
+                }
+                Ok((Response::Error(e), _)) => {
+                    eprintln!("error: {} (code {})", e.error.message, e.error.code);
+                    std::process::exit(1);
+                }
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+            }
+        }
+        "close-tab" => {
+            if args.len() < 3 {
+                eprintln!("usage: zm-mux close-tab <tab_id>");
+                std::process::exit(1);
+            }
+            let tab_id: u32 = args[2].parse().unwrap_or_else(|_| {
+                eprintln!("error: tab_id must be a number");
+                std::process::exit(1);
+            });
+            let req = Request {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: RequestId::Num(1),
+                method: MuxMethod::CloseTab.as_str().to_string(),
+                params: serde_json::to_value(CloseTabParams { tab_id }).unwrap(),
+            };
+            match client.call(&req) {
+                Ok((Response::Success(_), _)) => println!("ok"),
+                Ok((Response::Error(e), _)) => {
+                    eprintln!("error: {} (code {})", e.error.message, e.error.code);
+                    std::process::exit(1);
+                }
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+            }
+        }
+        "agent-info" => {
+            if args.len() < 3 {
+                eprintln!("usage: zm-mux agent-info <pane_id> [type] [status]");
+                eprintln!("  type:   claude | codex | gemini | unknown");
+                eprintln!("  status: waiting | active | complete | error | unknown");
+                std::process::exit(1);
+            }
+            let pane_id: u32 = args[2].parse().unwrap_or_else(|_| {
+                eprintln!("error: pane_id must be a number");
+                std::process::exit(1);
+            });
+            let agent_type = args.get(3).cloned();
+            let agent_status = args.get(4).cloned();
+            let req = Request {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: RequestId::Num(1),
+                method: MuxMethod::SetAgentInfo.as_str().to_string(),
+                params: serde_json::to_value(SetAgentInfoParams { pane_id, agent_type, agent_status }).unwrap(),
+            };
+            match client.call(&req) {
+                Ok((Response::Success(_), _)) => println!("ok"),
+                Ok((Response::Error(e), _)) => {
+                    eprintln!("error: {} (code {})", e.error.message, e.error.code);
+                    std::process::exit(1);
+                }
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+            }
+        }
+        "--version" | "-V" => {
+            println!("zm-mux {}", env!("CARGO_PKG_VERSION"));
+        }
+        "--help" | "-h" | "help" => {
+            println!("zm-mux — AI agent terminal multiplexer");
+            println!();
+            println!("USAGE:");
+            println!("  zm-mux                                 Launch GUI");
+            println!("  zm-mux list                            List panes");
+            println!("  zm-mux status                          Show status");
+            println!("  zm-mux send <pane_id> <text>           Send text to pane");
+            println!("  zm-mux focus <pane_id>                 Focus pane");
+            println!("  zm-mux split <pane_id> <h|v>           Split pane");
+            println!("  zm-mux close-pane <pane_id>            Close pane");
+            println!("  zm-mux new-tab                         Create tab");
+            println!("  zm-mux close-tab <tab_id>              Close tab");
+            println!("  zm-mux agent-info <pane_id> [type] [status]  Set agent info");
+            println!("  zm-mux --version                       Show version");
+        }
+        other => {
+            eprintln!("unknown subcommand: {other}");
+            eprintln!("run 'zm-mux --help' for usage");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        cli_main(&args);
+        return;
+    }
+
     let config = Config::load();
     let parsed = match config.keybindings.parse() {
         Ok(p) => p,
@@ -1345,17 +1977,28 @@ fn main() {
         }
     };
 
+    let socket_name = socket_name_for_pid();
+    // SAFETY: single-threaded here — no PTY or reader threads spawned yet.
+    // Must be set before MuxState::new() so the initial pane's shell inherits it.
+    unsafe { std::env::set_var("ZM_MUX_SOCKET_PATH", &socket_name) };
+
     let (fr, fg, fb) = config.colors.foreground_rgb();
     let (br, bg, bb) = config.colors.background_rgb();
     let default_fg = CellColor::new(fr, fg, fb);
     let default_bg = CellColor::new(br, bg, bb);
 
+    let workspace_id = format!("zm-{}", std::process::id());
     let state = Arc::new(Mutex::new(MuxState::new(
         config.shell.clone(),
         config.scrollback.max_lines,
         default_fg,
         default_bg,
+        workspace_id,
+        socket_name.clone(),
     )));
+
+    start_socket_server(Arc::clone(&state), socket_name.clone());
+    eprintln!("zm-mux: socket API listening on {socket_name}");
 
     let event_loop = EventLoop::new().expect("event loop");
     let mut app = App::new(state, config, parsed);

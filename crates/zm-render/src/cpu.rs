@@ -15,8 +15,6 @@ const JETBRAINS_MONO_REGULAR: &[u8] =
 
 const BG_PANE: u32 = 0x00_000000;
 const CURSOR_COLOR: u32 = 0x00_CCCCCC;
-const BORDER_FOCUSED: u32 = 0x00_4488FF;
-const BORDER_UNFOCUSED: u32 = 0x00_444444;
 const BG_TAB_BAR: u32 = 0x00_0F0F1A;
 const BG_TAB_ACTIVE: u32 = 0x00_2A4880;
 const BG_TAB_INACTIVE: u32 = 0x00_1A1A2E;
@@ -326,11 +324,8 @@ impl CellShaper {
             );
         }
 
-        let border = if pane.focused {
-            BORDER_FOCUSED
-        } else {
-            BORDER_UNFOCUSED
-        };
+        let (br, bg, bb) = pane.border_color_srgb;
+        let border = ((br as u32) << 16) | ((bg as u32) << 8) | (bb as u32);
         draw_pane_border(buf, buf_width, buf_height, r, border);
 
         if pane.focused

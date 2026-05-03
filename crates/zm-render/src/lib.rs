@@ -37,6 +37,10 @@ pub struct PaneRenderInfo<'a> {
     pub highlights: &'a [HighlightCell],
     /// Selection cells to overlay with a translucent blue highlight.
     pub selection_highlights: &'a [HighlightCell],
+    /// Per-pane border color in sRGB, pre-computed by the caller from
+    /// agent status and focus state.  Replaces the old hardcoded
+    /// focused/unfocused constants.
+    pub border_color_srgb: (u8, u8, u8),
 }
 
 /// One search-hit span in a pane's viewport, in cell units.

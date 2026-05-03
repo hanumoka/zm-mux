@@ -13,6 +13,7 @@ zm-render = { workspace = true }
 zm-mux = { workspace = true }
 zm-agent = { workspace = true }
 zm-socket = { workspace = true }
+serde_json = { workspace = true }
 winit = { workspace = true }
 notify-rust = "4"
 arboard = { workspace = true }
