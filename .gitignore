@@ -1,0 +1,16 @@
+# Build output
+/target
+
+# Reference repositories — cloned locally as read-only study material.
+# Not part of this repo. Reproduce via scripts/clone-references.*; tracked
+# inventory (URL/license/pinned SHA) lives in docs/research/05-reference-inventory.md
+/reference/
+
+# Scratch / diagnostics
+/.agent-tmp/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*~
