@@ -1,0 +1,22 @@
+[package]
+name = "zm-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "zm-mux local socket automation: JSON protocol + server bridge + `zm` CLI client."
+
+[lib]
+name = "zm_ipc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zm"
+path = "src/bin/zm.rs"
+
+[dependencies]
+zm-core.workspace = true
+interprocess.workspace = true
+serde.workspace = true
+serde_json.workspace = true

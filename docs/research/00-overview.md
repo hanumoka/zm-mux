@@ -70,6 +70,9 @@ tmux-shim/`CMUX_*`식 env 우회 또는 CustomPaneBackend(#26572, *open*) 트랙
 - [04-ai-agent-integration.md](04-ai-agent-integration.md) — Claude Code/AI 에이전트 연동
 - [05-reference-inventory.md](05-reference-inventory.md) — 참고 repo/원문 인벤토리 (라이선스·등급·SHA)
 - [06-feasibility-and-roadmap.md](06-feasibility-and-roadmap.md) — 종합 판정·리스크·로드맵
+- [07-poc-conpty-istty-results.md](07-poc-conpty-istty-results.md) — Phase 0 PoC 실측(R1 isTTY + R2 lockstep)
+- [08-implementation-status.md](08-implementation-status.md) — **구현 현황(Phase 0–3 자율 완성)**
+- [../configuration.md](../configuration.md) — 사용자 설정(config.toml) 스키마
 - [references.md](references.md) — 전 출처 서지
 
 > 작성 기준일: 2026-06-15. 재검증 시점의 라이브 값(이슈 상태/버전)은 이후 변동 가능.

@@ -1,0 +1,29 @@
+[package]
+name = "zm-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "zm-mux R1 isTTY verification: ConPTY child isatty/isTTY measurement harness (headless, CI-friendly)."
+
+# 두 바이너리:
+#   zm-probe          — ConPTY 자식으로 실행되어 isTTY를 한 줄 마커로 출력
+#   zm-probe-harness  — node/python/rust × (직접/cmd/pwsh/powershell)을 ConPTY로 spawn해 측정
+
+[[bin]]
+name = "zm-probe"
+path = "src/bin/zm-probe.rs"
+
+[[bin]]
+name = "zm-probe-harness"
+path = "src/bin/zm-probe-harness.rs"
+
+[[bin]]
+name = "zm-rawtest"
+path = "src/bin/zm-rawtest.rs"
+
+[dependencies]
+zm-core.workspace = true
+zm-pty.workspace = true
+portable-pty.workspace = true

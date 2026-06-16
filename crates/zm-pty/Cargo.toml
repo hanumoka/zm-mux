@@ -1,0 +1,12 @@
+[package]
+name = "zm-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "zm-mux PTY abstraction over portable-pty (ConPTY on Windows, POSIX PTY elsewhere)."
+
+[dependencies]
+zm-core.workspace = true
+portable-pty.workspace = true

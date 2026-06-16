@@ -1,0 +1,13 @@
+[package]
+name = "zm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "zm-mux shared types: grid geometry, cell snapshot, color, errors (OS-independent)."
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+toml.workspace = true

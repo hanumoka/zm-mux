@@ -1,0 +1,11 @@
+[package]
+name = "zm-mux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "zm-mux multiplexer core: session/tab/pane tree + split layout (Phase 1, stub)."
+
+[dependencies]
+zm-core.workspace = true

@@ -1,0 +1,50 @@
+# zm-mux workspace — Phase 0 PoC
+# 버전 SSOT: 모든 멤버 크레이트는 아래 [workspace.dependencies]를 통해 lockstep 사용.
+# 근거: docs/research/02 §2 (크레이트 스택), 03 §2 (크레이트 레이아웃), 06 (로드맵).
+[workspace]
+resolver = "2"
+members = [
+    "crates/zm-core",
+    "crates/zm-pty",
+    "crates/zm-term",
+    "crates/zm-render",
+    "crates/zm-app",
+    "crates/zm-probe",
+    "crates/zm-mux",
+    "crates/zm-ipc",
+    "crates/zm-agent",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hanumoka/zm-mux"
+rust-version = "1.95"
+
+[workspace.dependencies]
+# 내부 크레이트
+zm-core = { path = "crates/zm-core" }
+zm-pty = { path = "crates/zm-pty" }
+zm-term = { path = "crates/zm-term" }
+zm-render = { path = "crates/zm-render" }
+
+# 외부 크레이트 (R2 lockstep — cargo check로 최종 확정)
+# glyphon 0.11.0 → wgpu ^29 + cosmic-text ^0.18 (crates.io 실측). cosmic-text는 glyphon::cosmic_text 재노출 사용.
+portable-pty = "0.9"
+alacritty_terminal = "0.26"
+winit = "0.30"
+wgpu = "29"
+glyphon = "0.11"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+interprocess = "2"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.dev]
+opt-level = 1          # PoC: 디버그 빌드도 터미널 응답성 확보용 최소 최적화

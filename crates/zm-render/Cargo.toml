@@ -1,0 +1,15 @@
+[package]
+name = "zm-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "zm-mux GPU renderer: wgpu + glyphon text + bg/cursor rect pipeline."
+
+[dependencies]
+zm-core.workspace = true
+wgpu.workspace = true
+glyphon.workspace = true
+winit.workspace = true
+bytemuck.workspace = true

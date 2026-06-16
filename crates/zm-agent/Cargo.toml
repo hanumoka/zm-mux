@@ -1,0 +1,22 @@
+[package]
+name = "zm-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "zm-mux agent integration (track A): tmux-compat shim + agent env injection."
+
+[lib]
+name = "zm_agent"
+path = "src/lib.rs"
+
+# tmux 호환 shim: Claude Code 등이 'tmux ...' 실행 시 zm-ipc로 변환.
+[[bin]]
+name = "tmux"
+path = "src/bin/tmux.rs"
+
+[dependencies]
+zm-core.workspace = true
+zm-ipc = { path = "../zm-ipc" }
+serde_json.workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "zm-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "zm-mux application entry: winit event loop wiring PTY + terminal + renderer (single-pane PoC)."
+
+[[bin]]
+name = "zm-app"
+path = "src/main.rs"
+
+[dependencies]
+zm-core.workspace = true
+zm-pty.workspace = true
+zm-term.workspace = true
+zm-render.workspace = true
+zm-mux = { path = "../zm-mux" }
+zm-ipc = { path = "../zm-ipc" }
+zm-agent = { path = "../zm-agent" }
+winit.workspace = true
+pollster.workspace = true
+log.workspace = true
+env_logger.workspace = true
+serde_json.workspace = true
+notify-rust = "4"
